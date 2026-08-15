@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "0d_cv_post_ignition_quasistationary_v1": {
+      "description": "Post-ignition quasistationary product-state termination for homogeneous constant-volume H2-air reactors. Activation prevents false termination during the induction period; convergence is tested over a 100 us physical-time window.",
+      "history_file": "reactor_history.dat",
+      "check_wall_interval_s": 5.0,
+      "required_run_control_modes": [
+        "wall_time"
+      ],
+      "activation": {
+        "mode": "any",
+        "minimum_temperature_rise_K": 200.0,
+        "fuel_species": "H2",
+        "minimum_fuel_consumed_fraction": 0.05
+      },
+      "window": {
+        "duration_s": 0.0001,
+        "min_points": 50
+      },
+      "tolerances": {
+        "relative_temperature_span": 1e-06,
+        "relative_pressure_span": 1e-06,
+        "relative_density_span": 1e-08,
+        "max_species_mass_fraction_span": 1e-08,
+        "max_sumY_error": 1e-08
+      }
+    }
+  }
+}

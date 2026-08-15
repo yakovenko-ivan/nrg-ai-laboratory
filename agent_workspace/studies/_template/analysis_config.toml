@@ -1,0 +1,22 @@
+[study]
+name = "template"
+write_canonical_history = false
+
+# For large studies, the trusted runner exposes pilot/full mode and a shared
+# per-case cache directory via NRG_STUDY_* environment variables. Study-specific
+# code should include the relevant analysis/config/raw-input identity in cache
+# validation rather than treating cached products as authoritative inputs.
+[analysis_execution]
+per_case_cache = true
+continue_after_case_analysis_error = true
+
+[ignition]
+delta_temperature_K = 400.0
+radical_species = ["OH", "H"]
+
+[equilibrium]
+final_window_fraction = 0.10
+max_relative_temperature_span = 1.0e-6
+max_relative_pressure_span = 1.0e-6
+max_species_mass_fraction_span = 1.0e-8
+max_sumY_error = 1.0e-9

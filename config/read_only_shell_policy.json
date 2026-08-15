@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "max_timeout_ms": 60000,
+  "allowed_commands": [
+    "pwd",
+    "ls",
+    "tree",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "du",
+    "df",
+    "stat",
+    "file",
+    "realpath",
+    "readlink",
+    "grep",
+    "rg",
+    "find",
+    "uniq",
+    "cut",
+    "sha256sum",
+    "cmp",
+    "diff",
+    "uname",
+    "whoami",
+    "uptime",
+    "git"
+  ],
+  "git_subcommands": [
+    "status",
+    "log",
+    "diff",
+    "branch",
+    "show",
+    "rev-parse",
+    "ls-files"
+  ],
+  "blocked_options": {
+    "tree": [
+      "-o",
+      "--output",
+      "-l",
+      "--follow"
+    ],
+    "file": [
+      "-C",
+      "--compile"
+    ],
+    "rg": [
+      "--pre",
+      "--pre-glob",
+      "-L",
+      "--follow"
+    ],
+    "du": [
+      "-L",
+      "--dereference",
+      "-H",
+      "-D"
+    ]
+  }
+}

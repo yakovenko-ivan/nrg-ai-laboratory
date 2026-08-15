@@ -1,0 +1,30 @@
+{
+  "schema_version": 3,
+  "configuration_source": "config/laboratory.toml",
+  "agent_write_roots": [
+    "paths.studies_root",
+    "paths.campaign_root/definitions"
+  ],
+  "agent_read_only_roots": [
+    "paths.runs_root",
+    "paths.task_setup_template",
+    "runtime.computing_module",
+    "runtime.package_interface_0d",
+    "research_root/nrg_analysis",
+    "research_root/campaign_tools",
+    "research_root/.pi/extensions",
+    "research_root/config"
+  ],
+  "agent_shell_policy": "bash_tool_disabled_use_nrg_custom_tools",
+  "raw_result_policy": "read_only",
+  "runtime_policy": "read_execute_only",
+  "study_code_policy": "agent_editable",
+  "campaign_spec_policy": "agent_editable_in_definitions_with_execution_approval",
+  "campaign_execution_policy": "explicit_user_confirmation_via_pi_tool",
+  "trusted_infrastructure_policy": "no_agent_modification_without_explicit_out_of_band_user_action",
+  "notes": [
+    "The Pi extension enforces write/edit path restrictions and disables agent bash calls.",
+    "The study execution wrapper detects raw-input mutation but is not an OS sandbox.",
+    "Filesystem permissions remain the strongest protection for trusted runtime and raw results."
+  ]
+}

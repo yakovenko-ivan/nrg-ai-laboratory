@@ -1,0 +1,42 @@
+# Machine-local overrides for config/laboratory.toml.
+#
+# Copy this file to config/laboratory.local.toml.  The local file is gitignored
+# and may contain absolute paths to an independently cloned/built NRG
+# installation.  Unspecified values inherit from the committed portable base
+# configuration.
+#
+# IMPORTANT: ${NAME} substitution reads PROCESS ENVIRONMENT VARIABLES.  A TOML
+# assignment such as NRG_SOURCE_ROOT = "/path/to/NRG" does NOT define a variable
+# that can subsequently be referenced as ${NRG_SOURCE_ROOT} in this file.
+
+[paths]
+# Recommended: use an explicit machine-local path.
+# task_setup_template = "/absolute/path/to/NRG/package_interface/task_setup"
+
+# Optional: keep active research state on another disk.
+# campaign_root = "/absolute/path/to/research/campaigns"
+# runs_root = "/absolute/path/to/research/runs"
+# studies_root = "/absolute/path/to/research/studies"
+
+# Environment-variable form is also supported, but the variable must already
+# exist in the shell/process environment before the laboratory is started, e.g.
+#   export NRG_SOURCE_ROOT=/absolute/path/to/NRG
+# task_setup_template = "${NRG_SOURCE_ROOT}/package_interface/task_setup"
+
+[runtime]
+# NRG executables are built in the NRG repository, not in this project.
+# Adjust Release/Debug components to match the actual NRG CMake build.
+# computing_module = "/absolute/path/to/NRG/build/bin/computing_module"
+
+# The package-interface filename depends on the Fortran interface source chosen
+# when configuring NRG.  Point this to the validated 0-D campaign interface.
+# package_interface_0d = "/absolute/path/to/NRG/build/bin/package_interface_0D_ignition_delay_campaign"
+
+# Environment-variable alternatives, if exported before launching the lab:
+#   export NRG_BUILD_ROOT=/absolute/path/to/NRG/build
+#   export NRG_PACKAGE_INTERFACE_0D=/absolute/path/to/package_interface_executable
+# computing_module = "${NRG_BUILD_ROOT}/bin/computing_module"
+# package_interface_0d = "${NRG_PACKAGE_INTERFACE_0D}"
+
+[execution]
+# default_threads = 1

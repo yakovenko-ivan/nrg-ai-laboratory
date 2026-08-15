@@ -1,0 +1,28 @@
+[extension]
+name = "0D_CV_H2_mechanisms_TP_product_state_extension"
+generator_output_directory = "0D_CV_H2_mechanisms_TP_product_state_extension_generated"
+base_cases = "0D_CV_H2_mechanisms_TP_generated/cases.csv"
+case_id_prefix = "E"
+case_id_width = 6
+max_cases = 20
+
+base_case_ids = [
+  "R000003",
+  "R000010",
+  "R000013",
+  "R000014",
+  "R000016",
+  "R000017",
+  "R000018",
+  "R000020",
+  "R000023",
+  "R000043",
+  "R000063",
+  "R000083",
+]
+
+[overrides.run_control_config]
+termination_mode = "wall_time"
+final_time_ms = 1000.0
+wall_time_limit_s = 3600.0
+wall_time_reserve_s = 60.0

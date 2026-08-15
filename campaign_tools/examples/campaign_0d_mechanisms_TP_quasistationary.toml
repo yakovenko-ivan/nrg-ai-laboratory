@@ -1,0 +1,73 @@
+# 0D constant-volume H2-air campaign intended for trusted physical termination.
+# The NRG core uses wall-time only as a safety/restart bound. The laboratory
+# runner stops successfully when 0d_cv_post_ignition_quasistationary_v1 is met.
+
+[campaign]
+name = "0D_CV_H2_mechanisms_T1000_1500_P1_5atm_quasistationary"
+generator_output_directory = "0D_CV_H2_mechanisms_TP_quasistationary_generated"
+case_id_prefix = "R"
+case_id_width = 6
+human_readable_directories = true
+max_case_directory_length = 120
+max_cases = 150
+
+[case_identity]
+# Logical case axes for this chemistry campaign. Changing any of these values
+# creates a new case. These fields remain stable when the campaign is appended.
+fields = [
+  "mixture_config.initial_temperature",
+  "mixture_config.initial_pressure",
+  "physics_config.mechanism_id",
+]
+
+[attempt_overrides]
+# Reviewed recalculation knobs. Identity-axis fields are blocked even if they
+# would otherwise match this allow-list.
+allowed = [
+  "physics_config.initial_time_step",
+  "physics_config.cfl_enabled",
+  "physics_config.cfl_coefficient",
+  "run_control_config.*",
+  "output_config.*",
+]
+
+[defaults.case_config]
+
+[defaults.reactor_config]
+reactor_type = "constant_volume"
+cells_number_x = 2
+cell_length_x = 1.0e-4
+
+[defaults.mixture_config]
+hydrogen_mole_percent = 20.0
+n2_o2_molar_ratio = 3.762
+initial_temperature = 1000.0
+initial_pressure = 101325.0
+
+[defaults.physics_config]
+mechanism_id = "keromnes"
+solver_id = "cpm"
+initial_time_step = 1.0e-8
+cfl_enabled = false
+cfl_coefficient = 0.25
+
+[defaults.run_control_config]
+termination_mode = "wall_time"
+# Inactive in wall_time mode; retained because the package-interface schema
+# requires the field. The trusted external physical profile is the success criterion.
+final_time_ms = 1000.0
+wall_time_limit_s = 3600.0
+wall_time_reserve_s = 60.0
+
+[defaults.output_config]
+postprocess_interval_us = 0.1
+field_save_interval_us = 1000.0
+checkpoint_interval_us = 250.0
+save_spatial_fields = false
+
+[sweep.mixture_config]
+initial_temperature = [1000.0, 1100.0, 1200.0, 1300.0, 1400.0, 1500.0]
+initial_pressure = [101325.0, 202650.0, 303975.0, 405300.0, 506625.0]
+
+[sweep.physics_config]
+mechanism_id = ["konnov", "keromnes", "tereza", "zhang"]

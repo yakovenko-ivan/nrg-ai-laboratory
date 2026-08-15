@@ -1,0 +1,23 @@
+{
+  "threads": 1,
+  "max_concurrent_cases": 1,
+  "limit_library_threads": true,
+  "poll_seconds": 1.0,
+  "max_runtime_seconds": 3700,
+  "success_exit_codes": [
+    0
+  ],
+  "skip_statuses": [
+    "finished",
+    "condition_met"
+  ],
+  "rerun_failed": true,
+  "archive_old_monitor_files": false,
+  "monitor_log_each_read": false,
+  "verify_case_fingerprint": true,
+  "stop_request_file": "run_control.stop",
+  "run_control_status_file": "run_control_status.inf",
+  "graceful_stop_timeout_seconds": 30,
+  "force_kill_on_graceful_stop_timeout": true,
+  "monitor_rules": []
+}

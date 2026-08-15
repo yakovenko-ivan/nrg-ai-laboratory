@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+# Machine-local configuration
+# -----------------------------------------------------------------------------
+/config/laboratory.local.toml
+.env
+.env.*
+!.env.example
+
+# -----------------------------------------------------------------------------
+# External NRG source/build/runtime integration
+# -----------------------------------------------------------------------------
+# A convenient local layout is .local/NRG, but the NRG repository may live
+# anywhere and be referenced from laboratory.local.toml.
+/.local/
+
+# -----------------------------------------------------------------------------
+# Active scientific research state (never source-repository content)
+# -----------------------------------------------------------------------------
+/campaigns/
+/runs/
+
+# Study instances are use-case-specific research work.  Keep only the reviewed
+# reusable template in Git; curated examples belong under examples/ or docs/.
+/agent_workspace/studies/*
+!/agent_workspace/studies/_template/
+!/agent_workspace/studies/_template/**
+!/agent_workspace/studies/.gitignore
+
+# Common local scientific outputs if created outside the standard roots.
+*.log
+*.pid
+*.lock
+run_control.stop
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+/.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+/.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# -----------------------------------------------------------------------------
+# Node/Pi local state not belonging to project-local extensions/skills
+# -----------------------------------------------------------------------------
+node_modules/
+
+# -----------------------------------------------------------------------------
+# IDE / OS temporary files
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo

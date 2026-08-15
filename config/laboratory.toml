@@ -1,0 +1,35 @@
+# Portable repository configuration for the NRG AI Laboratory Assistant.
+#
+# This repository is an agentic research supplement to the NRG CFD package.
+# NRG source code, task-setup resources, and compiled executables are external
+# dependencies and are not shipped here.
+#
+# The portable defaults below assume an OPTIONAL local NRG checkout at
+# <repository>/.local/NRG.  The .local/ directory is gitignored.  A checkout in
+# any other location should be selected in config/laboratory.local.toml or by
+# environment-variable-expanded paths.
+
+[paths]
+# laboratory.toml lives in <repository>/config, so ".." is this repository.
+research_root = ".."
+
+# Local research state.  These directories need not exist in a fresh clone.
+campaign_root = "campaigns"
+runs_root = "runs"
+studies_root = "agent_workspace/studies"
+
+# External NRG package-interface data.  NRG keeps task_setup under
+# package_interface/task_setup.
+task_setup_template = ".local/NRG/package_interface/task_setup"
+
+[runtime]
+# External NRG build products.  The NRG CMake build writes executables under
+# build/bin for single-config generators; override these paths when your build
+# layout differs (e.g. Visual Studio Release subdirectory).
+computing_module = ".local/NRG/build/bin/computing_module"
+package_interface_0d = ".local/NRG/build/bin/package_interface_0D_ignition_delay_campaign"
+
+[execution]
+default_threads = 1
+runner_config = "config/campaign_runner.json"
+termination_profiles = "config/termination_profiles.json"

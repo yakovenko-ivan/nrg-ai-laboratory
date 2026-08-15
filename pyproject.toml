@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nrg-ai-laboratory"
+dynamic = ["version"]
+description = "Portable agentic laboratory infrastructure and reusable analysis tools for the external NRG CFD package"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+"NRG upstream" = "https://github.com/yakovenko-ivan/NRG"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+nrg-lab = "agent_workspace.lab_bridge:main"
+nrg-lab-config = "nrg_analysis.config_cli:main"
+nrg-lab-doctor = "nrg_analysis.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nrg_analysis*", "agent_workspace*", "campaign_tools*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+agent_workspace = [
+  "workspace_policy.json",
+  "studies/_template/STUDY.md",
+  "studies/_template/analysis_config.toml",
+  "studies/_template/analyze.py",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "nrg_analysis._version.__version__"}
