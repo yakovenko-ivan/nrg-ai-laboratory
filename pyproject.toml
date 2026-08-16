@@ -16,6 +16,11 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+visualization = [
+    "numpy>=2.5,<3",
+    "matplotlib>=3.11,<4",
+]
+
 [project.scripts]
 nrg-lab = "agent_workspace.lab_bridge:main"
 nrg-lab-config = "nrg_analysis.config_cli:main"

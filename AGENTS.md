@@ -123,6 +123,8 @@ Keep these provenance concepts separate:
   concept as `selective_rerun_job_id`.
 - quasistationarity audit status is a physical classification derived from
   `reactor_history.dat`; it does not state why the executable terminated.
+- A successful `nrg_campaign_quasistationary_audit` response must contain its structured audit contract, including `case_count`, `counts`, `quasistationary_count`, and `needs_recalculation_count`. An empty object (`{}`), missing required audit fields, timeout, or bridge error is an invalid/incomplete audit result and must never be interpreted as zero anomalies or as proof that all cases are quasistationary.
+- `nrg_campaign_execution_summary` is the preferred fast campaign-wide check for current execution provenance and online physical-condition metadata. It reads `run_status.json` only and does **not** replace an independent `reactor_history.dat` quasistationarity audit.
 - execution status and `nrg_termination_reason` come from the current
   `run_status.json` and must be reported separately from audit classification.
 

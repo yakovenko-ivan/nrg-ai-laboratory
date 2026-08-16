@@ -77,6 +77,13 @@ The window average is the representative product state; do not substitute the fi
 
 Where the runtime stored a `product_state`, independently recompute the same window average and compare both values as a consistency check.
 
+When verifying a completed campaign, keep **online execution evidence** and the **offline history audit** distinct:
+
+- `nrg_campaign_execution_summary` reads current `run_status.json` records and can establish how many cases ended as `condition_met`, which NRG termination reasons were recorded, which trusted termination profiles were used, and what online `physical_condition_*` metadata was stored.
+- `nrg_campaign_quasistationary_audit` independently evaluates `reactor_history.dat` against the trusted profile.
+
+A valid offline audit must contain the structured audit fields `case_count`, `counts`, `quasistationary_count`, and `needs_recalculation_count`. An empty object (`{}`), timeout, bridge failure, or response missing these fields is **not** evidence that every case passed. Do not repeatedly launch the same expensive full-history audit after an infrastructure error; report the failure and diagnose the tool path first.
+
 ## 5. Constant-volume integrity diagnostics
 
 For closed constant-volume cases, calculate appropriate checks such as:

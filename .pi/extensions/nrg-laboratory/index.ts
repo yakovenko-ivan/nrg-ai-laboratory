@@ -18,6 +18,8 @@ const PYTHON = process.env.NRG_PYTHON
 const LAB_CONFIG = process.env.NRG_LABORATORY_CONFIG || join(PROJECT_ROOT, "config", "laboratory.toml");
 const READ_ONLY_SHELL_POLICY = process.env.NRG_READ_ONLY_SHELL_POLICY || join(PROJECT_ROOT, "config", "read_only_shell_policy.json");
 
+const LONG_READ_ONLY_AUDIT_TIMEOUT_MS = 30 * 60_000;
+
 type JsonObject = Record<string, any>;
 
 type LabState = {
@@ -59,13 +61,37 @@ export default function (pi: ExtensionAPI) {
 
   async function bridge(args: string[], signal?: AbortSignal, timeout = 120_000): Promise<JsonObject> {
     const command = ["-m", "agent_workspace.lab_bridge", "--laboratory", LAB_CONFIG, ...args];
-    const result = await pi.exec(PYTHON, command, { signal, timeout });
-    const payload = parseJson(result.stdout || "{}");
-    if (result.code !== 0 && !payload.error) {
-      payload.error = `bridge exited with code ${result.code}`;
-      payload.stderr = result.stderr;
+    try {
+      const result = await pi.exec(PYTHON, command, { signal, timeout });
+      const stdout = (result.stdout ?? "").trim();
+      const stderr = (result.stderr ?? "").trim();
+
+      if (!stdout) {
+        return {
+          error: "laboratory bridge returned empty stdout",
+          exit_code: result.code ?? null,
+          stderr: stderr || null,
+          command: [PYTHON, ...command],
+          timeout_ms: timeout,
+        };
+      }
+
+      const payload = parseJson(stdout);
+      if (result.code !== 0 && !payload.error) {
+        payload.error = `bridge exited with code ${result.code}`;
+      }
+      if (result.code !== 0 && stderr) {
+        payload.stderr = stderr;
+      }
+      return payload;
+    } catch (error) {
+      return {
+        error: "laboratory bridge execution failed",
+        detail: error instanceof Error ? error.message : String(error),
+        command: [PYTHON, ...command],
+        timeout_ms: timeout,
+      };
     }
-    return payload;
   }
 
   async function ensureLab(signal?: AbortSignal): Promise<LabState> {
@@ -500,6 +526,28 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "nrg_campaign_execution_summary",
+    label: "NRG Campaign Execution Summary",
+    description: "Fast read-only campaign summary from current per-case run_status.json files. Reports execution status, NRG termination reasons, online physical-condition metadata, termination profiles, and runner provenance without reading reactor histories.",
+    promptSnippet: "Summarize how an NRG campaign executed without performing an expensive offline history audit",
+    promptGuidelines: [
+      "Use this tool for rapid campaign-wide execution/provenance checks, especially on large campaigns.",
+      "This tool reads current run_status.json only. It does not independently prove that stored reactor histories satisfy a quasistationarity profile.",
+      "Keep online physical-condition metadata separate from the offline history classification returned by nrg_campaign_quasistationary_audit.",
+      "Use nrg_campaign_quasistationary_audit when an independent reactor_history.dat audit is scientifically required.",
+    ],
+    parameters: Type.Object({
+      cases: Type.String({ description: "Path to the generated campaign cases.csv" }),
+    }),
+    async execute(_id, params, signal) {
+      return toolResult(await bridge([
+        "campaign-execution-summary",
+        "--cases", params.cases,
+      ], signal));
+    },
+  });
+
+  pi.registerTool({
     name: "nrg_campaign_quasistationary_audit",
     label: "NRG Quasistationary Audit",
     description: "Read-only audit of reactor histories against a trusted named post-ignition quasistationarity profile. History classification and current execution provenance are reported as separate dimensions.",
@@ -512,6 +560,8 @@ export default function (pi: ExtensionAPI) {
       "If reporting how cases terminated, use execution_provenance.status_counts and execution_provenance.nrg_termination_reason_counts from current run_status.json. Keep these separate from history-based audit counts.",
       "Do not say that wall_time mode means the wall-time limit was reached. Report the actual nrg_termination_reason.",
       "Keep attempt_id and runner_job_id distinct. One recalculation attempt may be executed across multiple runner jobs.",
+      "A successful audit response must contain case_count, counts, quasistationary_count, and needs_recalculation_count. An empty object {} is an invalid tool response and must never be interpreted as zero anomalies or universal quasistationarity.",
+      "Large full-history audits can take several minutes. If the tool reports an execution/timeout/empty-output error, do not immediately repeat the same expensive audit; report the tool failure and use nrg_campaign_execution_summary only for the separate execution/provenance question.",
     ],
     parameters: Type.Object({
       cases: Type.String({ description: "Path to the generated campaign cases.csv" }),
@@ -525,7 +575,7 @@ export default function (pi: ExtensionAPI) {
         "campaign-physical-audit",
         "--cases", params.cases,
         "--profile", params.profile ?? "0d_cv_post_ignition_quasistationary_v1",
-      ], signal));
+      ], signal, LONG_READ_ONLY_AUDIT_TIMEOUT_MS));
     },
   });
 

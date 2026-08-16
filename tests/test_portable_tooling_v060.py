@@ -53,7 +53,7 @@ class PortableToolingV060Tests(unittest.TestCase):
                 self.assertEqual(config_main(), 2)
 
     def test_doctor_repository_checks_pass_without_bundled_nrg(self):
-        report = collect_diagnostics(REPO_ROOT / "config" / "laboratory.toml")
+        report = collect_diagnostics(REPO_ROOT / "config" / "laboratory.toml", use_local=False)
         self.assertTrue(report["summary"]["repository_ready"])
         self.assertFalse(report["summary"]["nrg_runtime_ready"])
         names = {item["name"]: item for item in report["checks"]}

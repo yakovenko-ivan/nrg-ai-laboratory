@@ -10,7 +10,7 @@ This repository supplies the Pi-facing laboratory tools, deterministic campaign
 orchestration, trusted execution/provenance logic, reusable Python analysis, and
 scientific-study workflow needed to conduct CFD/combustion research with NRG.
 
-Current portable-repository release candidate: **v0.6.0**.
+Current portable-repository release: **v0.6.1**.
 
 ## Architecture
 

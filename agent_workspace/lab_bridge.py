@@ -1581,6 +1581,8 @@ def summarize_current_execution_provenance(campaign: Campaign) -> dict[str, Any]
     reason_counts: Counter[str] = Counter()
     condition_counts: Counter[str] = Counter()
     physical_status_counts: Counter[str] = Counter()
+    termination_profile_counts: Counter[str] = Counter()
+    physical_condition_met_counts: Counter[str] = Counter()
     attempt_ids: set[str] = set()
     runner_job_ids: set[str] = set()
     cases_with_attempt_id = 0
@@ -1610,10 +1612,20 @@ def summarize_current_execution_provenance(campaign: Campaign) -> dict[str, Any]
         reason = str(st.get("nrg_termination_reason") or "not_reported")
         condition = str(st.get("termination_condition") or "not_reported")
         physical_status = str(st.get("physical_condition_status") or "not_reported")
+        termination_profile = str(st.get("termination_profile") or "not_reported")
+        physical_condition_met_raw = st.get("physical_condition_met")
+        if physical_condition_met_raw is True:
+            physical_condition_met = "true"
+        elif physical_condition_met_raw is False:
+            physical_condition_met = "false"
+        else:
+            physical_condition_met = "not_reported"
         status_counts[status] += 1
         reason_counts[reason] += 1
         condition_counts[condition] += 1
         physical_status_counts[physical_status] += 1
+        termination_profile_counts[termination_profile] += 1
+        physical_condition_met_counts[physical_condition_met] += 1
 
         attempt_id = str(st.get("attempt_id") or "").strip()
         if attempt_id:
@@ -1654,6 +1666,8 @@ def summarize_current_execution_provenance(campaign: Campaign) -> dict[str, Any]
         "nrg_termination_reason_counts": dict(sorted(reason_counts.items())),
         "termination_condition_counts": dict(sorted(condition_counts.items())),
         "physical_condition_status_counts": dict(sorted(physical_status_counts.items())),
+        "termination_profile_counts": dict(sorted(termination_profile_counts.items())),
+        "physical_condition_met_counts": dict(sorted(physical_condition_met_counts.items())),
         "cases_with_attempt_id": cases_with_attempt_id,
         "unique_attempt_ids": sorted(attempt_ids),
         "cases_with_runner_job_id": cases_with_runner_job_id,
@@ -1678,6 +1692,34 @@ def summarize_current_execution_provenance(campaign: Campaign) -> dict[str, Any]
         "missing_or_invalid_run_status_limited_to": 20,
         "missing_or_invalid_run_status": invalid_or_missing,
     }
+
+
+def cmd_campaign_execution_summary(args: argparse.Namespace, lab: Laboratory) -> int:
+    # Fast execution-only campaign summary; does not read reactor histories.
+    cases = resolve(args.cases)
+    if not cases.is_file():
+        return emit({"error": f"cases.csv not found: {cases}"}, 2)
+    try:
+        campaign = Campaign.load(cases, lab.runs_root)
+        execution = summarize_current_execution_provenance(campaign)
+    except Exception as exc:
+        return emit({"error": str(exc)}, 2)
+
+    return emit({
+        "cases_csv": str(cases),
+        "case_count": len(campaign),
+        "summary_semantics": {
+            "basis": "current per-case run_status.json only",
+            "reactor_histories_read": False,
+            "establishes_offline_quasistationarity": False,
+            "online_physical_condition_note": (
+                "physical_condition_met/status and termination_profile are runtime metadata "
+                "recorded by the trusted physical-condition execution path; they are not an "
+                "independent re-evaluation of reactor_history.dat"
+            ),
+        },
+        **execution,
+    })
 
 
 def cmd_campaign_physical_audit(args: argparse.Namespace, lab: Laboratory) -> int:
@@ -2474,6 +2516,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--cases", required=True)
     s.add_argument("--run-config")  # private/manual override; not exposed to Pi
 
+    s = sub.add_parser("campaign-execution-summary")
+    s.add_argument("--cases", required=True)
+
     s = sub.add_parser("campaign-physical-audit")
     s.add_argument("--cases", required=True)
     s.add_argument("--profile", required=True)
@@ -2569,6 +2614,7 @@ def main() -> int:
             "campaign-generate": cmd_campaign_generate,
             "campaign-prepare": cmd_campaign_prepare,
             "campaign-start": cmd_campaign_start,
+            "campaign-execution-summary": cmd_campaign_execution_summary,
             "campaign-physical-audit": cmd_campaign_physical_audit,
             "campaign-physical-plan": cmd_campaign_physical_plan,
             "campaign-physical-start": cmd_campaign_physical_start,

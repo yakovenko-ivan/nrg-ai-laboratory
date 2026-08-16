@@ -81,6 +81,7 @@ def collect_diagnostics(
     laboratory: str | Path | None = None,
     *,
     local: str | Path | None = None,
+    use_local: bool = True,
     require_nrg: bool = False,
 ) -> dict[str, Any]:
     """Collect repository and external-NRG readiness without changing state.
@@ -113,6 +114,7 @@ def collect_diagnostics(
         lab = Laboratory.load(
             laboratory,
             local_path=local,
+            use_local=use_local,
             validate=False,
             require_runtime=False,
         )
@@ -317,12 +319,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="return nonzero for any optional warning, including missing Pi/Node/Git or NRG integration",
     )
+    parser.add_argument(
+    "--no-local",
+    action="store_true",
+    help="ignore laboratory.local.toml and inspect only the portable base configuration",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    report = collect_diagnostics(args.laboratory, local=args.local, require_nrg=args.require_nrg)
+    report = collect_diagnostics(args.laboratory, local=args.local, use_local=not args.no_local, require_nrg=args.require_nrg)
     print(json.dumps(report, indent=2, sort_keys=True))
     summary = report["summary"]
     if not summary["repository_ready"]:

@@ -2,6 +2,7 @@ from pathlib import Path
 import tempfile
 import tomllib
 import unittest
+import subprocess
 
 from nrg_analysis.doctor import collect_diagnostics
 from nrg_analysis.laboratory import Laboratory
@@ -35,13 +36,14 @@ class RepositoryHygieneV060Tests(unittest.TestCase):
             self.assertIn(rule, text)
 
     def test_no_runtime_validation_allows_repository_without_external_nrg(self):
-        lab = Laboratory.load(REPO_ROOT / "config" / "laboratory.toml", require_runtime=False)
+        lab = Laboratory.load(REPO_ROOT / "config" / "laboratory.toml", use_local=False, require_runtime=False)
         self.assertEqual(lab.research_root, REPO_ROOT.resolve())
         self.assertFalse(lab.computing_module.exists())
 
     def test_doctor_can_promote_external_nrg_to_required(self):
         report = collect_diagnostics(
             REPO_ROOT / "config" / "laboratory.toml",
+            use_local=False,
             require_nrg=True,
         )
         names = {item["name"]: item for item in report["checks"]}
@@ -59,20 +61,37 @@ class RepositoryHygieneV060Tests(unittest.TestCase):
             ".md", ".toml", ".json", ".py", ".ts", ".txt", ".gitignore", ".gitattributes"
         }
         offenders = []
-        for path in REPO_ROOT.rglob("*"):
+        
+        completed = subprocess.run(
+            ["git", "ls-files"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        for relative in completed.stdout.splitlines():
+            path = REPO_ROOT / relative
+
             if not path.is_file():
                 continue
-            if any(part in {".git", ".venv", "__pycache__", ".pytest_cache"} for part in path.parts):
+
+            if (
+                path.name not in {".gitignore", ".gitattributes"}
+                and path.suffix not in text_suffixes
+            ):
                 continue
-            if path.name not in {".gitignore", ".gitattributes"} and path.suffix not in text_suffixes:
-                continue
+
             try:
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
+
             for marker in forbidden:
                 if marker in text:
-                    offenders.append(f"{path.relative_to(REPO_ROOT)}: {marker}")
+                    offenders.append(
+                        f"{path.relative_to(REPO_ROOT)}: {marker}"
+                    )
         self.assertEqual(offenders, [])
 
     def test_local_config_example_does_not_define_fake_env_helpers(self):
