@@ -44,7 +44,9 @@ NUMERICAL_VARIANT_FIELD_MAP = {
 
 NON_CASE_GROUPS = (
     "reactor_config",
+    "geometry_config",
     "mixture_config",
+    "ignition_config",
     "physics_config",
     "run_control_config",
     "output_config",
@@ -229,6 +231,7 @@ def attempt_payload(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
         group: copy.deepcopy(groups[group])
         for group in NON_CASE_GROUPS
+        if group in groups
     }
 
 
@@ -304,6 +307,8 @@ def protected_constant_fields(
 ) -> tuple[str, ...]:
     fields: list[str] = []
     for group in NON_CASE_GROUPS:
+        if group not in groups:
+            continue
         for key in groups[group]:
             field = f"{group}.{key}"
             if field in policy.get("identity_fields", []):

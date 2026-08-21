@@ -1,0 +1,101 @@
+# NRG 1D H2-air wall/radial flame campaign: initial KEROMNES factorial.
+# Machine-specific paths are supplied by config/laboratory.toml and its local override.
+#
+# Factorial size:
+#   3 coordinate systems x 12 H2 concentrations x 2 meshes x
+#   2 radiation states x 2 Soret states = 288 logical cases.
+
+[campaign]
+name = "1D_H2_wall_flame_KEROMNES"
+generator_output_directory = "1D_H2_wall_flame_KEROMNES_generated"
+case_id_prefix = "R"
+case_id_width = 6
+human_readable_directories = true
+max_case_directory_length = 120
+max_cases = 400
+
+[case_identity]
+# These fields define a distinct scientific/numerical case. Output cadence,
+# run ceilings and CFL/dt settings are attempt-level controls and are excluded.
+fields = [
+  "geometry_config.coordinate_system",
+  "geometry_config.domain_length_m",
+  "geometry_config.cell_size_m",
+  "mixture_config.hydrogen_mole_percent",
+  "mixture_config.n2_o2_molar_ratio",
+  "mixture_config.initial_temperature",
+  "mixture_config.initial_pressure",
+  "ignition_config.ignition_temperature",
+  "ignition_config.ignition_width_m",
+  "ignition_config.ignition_h2o_moles",
+  "ignition_config.ignition_n2_moles",
+  "physics_config.mechanism_id",
+  "physics_config.solver_id",
+  "physics_config.thermal_radiation_enabled",
+  "physics_config.soret_diffusion_enabled",
+]
+
+[attempt_overrides]
+allowed = [
+  "physics_config.initial_time_step",
+  "physics_config.cfl_enabled",
+  "physics_config.cfl_coefficient",
+  "run_control_config.*",
+  "output_config.*",
+]
+
+[defaults.case_config]
+
+[defaults.geometry_config]
+coordinate_system = "cartesian"
+domain_length_m = 0.1024
+cell_size_m = 2.0e-4
+
+[defaults.mixture_config]
+hydrogen_mole_percent = 6.0
+n2_o2_molar_ratio = 3.762
+initial_temperature = 300.0
+initial_pressure = 101325.0
+
+[defaults.ignition_config]
+ignition_temperature = 3000.0
+ignition_width_m = 4.8e-3
+ignition_h2o_moles = 1.0
+ignition_n2_moles = 1.881
+
+[defaults.physics_config]
+mechanism_id = "keromnes"
+solver_id = "fds_low_mach"
+thermal_radiation_enabled = false
+soret_diffusion_enabled = false
+initial_time_step = 1.0e-7
+cfl_enabled = true
+cfl_coefficient = 0.25
+
+[defaults.run_control_config]
+# 'either' supplies a 30 s physical-time ceiling plus a wall-time safety ceiling.
+# A later flame-outcome controller may terminate a case earlier through
+# run_control.stop without changing the logical case identity.
+termination_mode = "either"
+final_time_s = 30.0
+wall_time_limit_s = 7200.0
+wall_time_reserve_s = 60.0
+
+[defaults.output_config]
+# These are the cadence values used in the successful manual postprocessor test.
+# They remain attempt-level knobs and can be relaxed later without changing case identity.
+postprocess_interval_ms = 1.0
+field_save_interval_ms = 1.0
+checkpoint_interval_ms = 5.0
+save_spatial_fields = true
+
+[sweep.geometry_config]
+coordinate_system = ["cartesian", "cylindrical", "spherical"]
+cell_size_m = [2.0e-4, 4.0e-4]
+
+[sweep.mixture_config]
+hydrogen_mole_percent = [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+
+[sweep.physics_config]
+thermal_radiation_enabled = [false, true]
+soret_diffusion_enabled = [false, true]
