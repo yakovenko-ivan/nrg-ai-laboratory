@@ -13,9 +13,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class RepositoryHygieneV060Tests(unittest.TestCase):
     def test_nrg_runtime_is_not_vendored(self):
-        self.assertFalse((REPO_ROOT / "nrg_runtime").exists())
-        self.assertFalse((REPO_ROOT / "campaigns").exists())
-        self.assertFalse((REPO_ROOT / "runs").exists())
+        # A live laboratory checkout may legitimately contain ignored local
+        # campaigns/runs. The portability contract is that these workspaces are
+        # never vendored into Git.
+        completed = subprocess.run(
+            ["git", "ls-files", "nrg_runtime", "campaigns", "runs"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(completed.stdout.splitlines(), [])
 
     def test_portable_defaults_reference_ignored_external_nrg_layout(self):
         data = tomllib.loads((REPO_ROOT / "config" / "laboratory.toml").read_text(encoding="utf-8"))

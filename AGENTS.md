@@ -45,6 +45,8 @@ Analysis code is part of the scientific investigation and may change substantial
     - **FINISHED** — normal successful completion.
     - **CONDITION_MET** — a scientific/monitoring stop criterion was satisfied.
     - **RESTART_REQUIRED** — execution stopped cleanly and should be continued from a checkpoint.
+    - **PAUSED** — execution was deliberately paused with a verified restart checkpoint. It is incomplete and resumes as the same logical case/attempt.
+    - **PAUSE_FAILED** — a pause was requested but a valid restart checkpoint was not verified; do not assume the case is restartable.
     - **INTERRUPTED** — a previous execution ceased unexpectedly; after verifying that no trusted `computing_module` process remains active, the case is recoverable and may be rerun.
     - **STOPPED** — execution was deliberately terminated by a trusted operator stop request. This is a clean operational stop, not a successful scientific completion; the case is rerunnable.
     - **TIMEOUT** — the runner or process exceeded its allowed execution time.
@@ -72,13 +74,16 @@ Analysis code is part of the scientific investigation and may change substantial
 - `nrg_campaign_status` and trusted start tools automatically use the laboratory runner policy.
 - When asked to preserve or skip already completed cases, inspect `execution_policy`, `skipped_by_policy`, and `runnable_by_status`; do not modify runner configuration unless the user explicitly requests an infrastructure-policy change.
 8. Monitor with `nrg_campaign_job_status` rather than guessing from logs.
-9. Use `nrg_campaign_stop` to terminate an active campaign runner cleanly. It prevents the stopped job from launching another case and, if a case is active, asks the runner to stop that case through `run_control.stop`. Use `nrg_case_stop` only when the user explicitly wants to stop the currently active case while allowing the runner to continue with later cases. Both operations require confirmation. Do not kill the runner or `computing_module` manually when a trusted stop tool is available.
+9. Prefer `nrg_campaign_pause` when the user intends to continue the campaign later. `mode=after_current` lets the active case finish normally and stops the runner before the next case. `mode=now` requests `run_control.pause`; NRG must write/register a restart checkpoint before the case is trusted as `paused`. Use `nrg_campaign_stop` only for deliberate terminal operational stopping, and `nrg_case_stop` only when the current case should be terminally stopped while later cases may continue. All operations require confirmation. Do not kill the runner or `computing_module` manually when a trusted control tool is available.
 10. After a stop request, inspect the returned control state or `nrg_campaign_job_status`. `handled` means the runner applied the request; `requested` or `acknowledged` is still pending; `rejected` means it was not applied. Never claim a stop completed from the request alone.
 11. After a VM or process interruption, re-check campaign status. A stale `running` record may be recovered by the trusted runner as `interrupted`; never delete successfully completed case data merely to resume a campaign.
 12. Treat `finished`, `condition_met`, `restart_required`, `interrupted`, `stopped`, `timeout`, and `failed` as distinct scientific/operational states.
 
 ## Trusted operator stop control
 
+- `nrg_campaign_pause` is the authoritative pause/resume operation. `after_current` never writes an NRG stop/pause marker; it only prevents the next case launch after the active case finishes. `now` writes `run_control.pause`, requires `external_pause_request` plus `restart_checkpoint_required = true`, and records `status = paused` only after that checkpoint contract is verified.
+- Resume a paused campaign with the ordinary trusted campaign start operation on the same immutable `cases.csv`. Do not regenerate the campaign and do not use selective rerun for ordinary continuation; completed cases remain skipped while `paused`/`restart_required` cases remain runnable.
+- After queueing `pause_after_current`, do not wait for case completion or repeatedly poll unless the user explicitly asks for status.
 - The NRG laboratory extension explicitly activates every registered `nrg_*` tool at session start. If a required trusted tool still appears unavailable, use `/nrg-tools` to inspect registered/active tool state, reload the project extension if appropriate, and do not substitute a semantically different tool.
 - `nrg_campaign_stop` is the authoritative operation for stopping the active campaign runner. The runner must stop launching new cases; if a CFD case is active, it first requests graceful NRG finalization through `run_control.stop` and uses the configured force-kill fallback only if NRG does not respond within the trusted graceful-stop timeout.
 - `nrg_case_stop` is narrower: it may stop only the exact case that is currently running, and the campaign runner may continue with later cases afterward. Do not use it when the user's intent is to stop or pause the entire campaign.
@@ -95,6 +100,19 @@ compact attempt-history metadata; it must not modify unselected cases or the gen
 - After reset, prepare the same campaign normally. Completed unselected cases remain authoritative and are skipped by trusted execution policy; reset cases are recreated and rerun under their reviewed attempt configuration. 
 - Use `nrg_campaign_append_preview` / `nrg_campaign_append` to add genuinely new design points to an existing campaign. Existing case IDs must never be renumbered. Append only when the campaign identity schema is unchanged and protected campaign constants do not conflict.
 - The older extension/composite workflow is reserved for genuinely independent, legacy, or externally produced datasets; do not use it merely because an existing logical case needs recalculation.
+
+## Portable execution workflow
+
+NRG campaign design/preparation and CFD execution may occur on different machines. Treat the agentic laboratory as the scientific control plane and a workstation/HPC environment as an execution plane.
+
+- After a campaign is defined, generated, audited, and PREPARED, use `nrg_campaign_export_bundle` to create the execution artifact. Export does not launch CFD.
+- The bundle freezes scientific identity and contains prepared case directories, portable relative case locators, a standalone standard-library `portable_executor.py`, checksums/provenance, and `execution.local.toml`.
+- On the compute host, only `execution.local.toml` may be edited for machine linkage (computing_module path, thread count, local backend options). Do not edit case namelists, task setups, fingerprints, `cases.csv`, or the portable executor to adapt a machine.
+- The compute host does not require Pi or package-interface executables. Run `validate`, then `run`/`resume`; use `pause --mode now` for a checkpointed interruption or `pause --mode after-current` to stop before the next case.
+- Do not wait for remote pilot/full calculations in the agentic session. After export/launch instructions are complete, stop acting; inspect status only when the user explicitly provides/requests access to that execution environment.
+- Return remote results with `portable_executor.py pack-results`. Back in the laboratory, use `nrg_campaign_import_results`; never copy returned files blindly into `runs/` when a verified import path is available.
+- Campaign/result transfer is portable across environments. Restart checkpoints are raw NRG binary state and may be moved only between binary-compatible NRG runtimes (compatible source/restart schema, kinds, and endianness; preferably identical build/runtime provenance).
+- Absolute paths recorded from the generation host are provenance only. Execution locators in portable manifests are relative to the bundle `runs/` root.
 
 ## Analysis workflow
 
@@ -135,3 +153,12 @@ The extension/composite workflow is reserved for genuinely independent, legacy, 
 
 - Do not infer missing numerical results. Distinguish numerical convergence, physical-model differences, chemistry-model differences, and analysis-definition differences. If current data cannot resolve a hypothesis, propose the smallest targeted follow-up campaign that can.
 - Report campaign parameters from structured campaign definitions or laboratory-tool output whenever available. Do not infer exact sweep values from filenames, labels, or a limited preview sample. If an exact parameter value is unavailable, state that it is unknown rather than presenting a guess as part of the campaign definition.
+
+## Bridge output policy
+
+- Trusted `lab_bridge.py` operational commands return compact JSON by default.
+- Rich job, runner-lock, case-status, hash, and provenance records remain persisted on disk; compact output is a projection, not a loss of provenance.
+- Use the CLI `--full` option only for diagnostics, compatibility investigation, or forensic provenance inspection. Do not request full payloads routinely in agent workflows.
+- For pause plans, the compact contract is `can_pause`; terminal stop plans use `can_stop`.
+- Prefer decisive operational fields (`job_id`, state, active case, counts, blockers, NRG termination reason/restart flag) over embedding complete historical records in tool responses.
+

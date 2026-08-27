@@ -546,7 +546,10 @@ def expected_paths(item: dict[str, Any]) -> tuple[Path, Path, Path]:
 
 
 def flatten_case(item: dict[str, Any]) -> dict[str, Any]:
-    case_path, data_save, data_output = expected_paths(item)
+    cfg = item["groups"]["case_config"]
+    case_relpath = Path(str(cfg["campaign_id"])) / item["case_directory"]
+    data_save_relpath = case_relpath / "data_save"
+    data_output_relpath = case_relpath / "data_output"
     row: dict[str, Any] = {
         "case_id": item["case_id"],
         "case_fingerprint": item["case_fingerprint"],
@@ -555,9 +558,10 @@ def flatten_case(item: dict[str, Any]) -> dict[str, Any]:
         "fingerprint_scheme": item.get("fingerprint_scheme", "legacy_full_configuration_v1"),
         "case_directory": item["case_directory"],
         "label": item["label"],
-        "case_path": case_path.as_posix(),
-        "data_save_path": data_save.as_posix(),
-        "data_output_path": data_output.as_posix(),
+        "case_relpath": case_relpath.as_posix(),
+        "case_path": case_relpath.as_posix(),
+        "data_save_path": data_save_relpath.as_posix(),
+        "data_output_path": data_output_relpath.as_posix(),
         "numerical_variant": item["numerical_variant"],
     }
     for group in NAMELIST_GROUPS:
@@ -603,6 +607,10 @@ def create_files(data: dict[str, Any], toml_path: Path, cases: list[dict[str, An
             sha256_file(laboratory.local_config_path) if laboratory.local_config_path else None
         ),
         "runs_root": str(laboratory.runs_root),
+        "path_contract": {
+            "case_path": "relative_to_laboratory_runs_root",
+            "absolute_generation_paths_authoritative": False,
+        },
         "package_interface_0d": str(laboratory.package_interface_0d),
         "package_interface_0d_sha256": sha256_file(laboratory.package_interface_0d),
         "computing_module": str(laboratory.computing_module),

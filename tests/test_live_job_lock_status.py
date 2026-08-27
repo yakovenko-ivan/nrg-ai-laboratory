@@ -75,7 +75,7 @@ class LiveJobLockStatusTests(unittest.TestCase):
 
             stream = io.StringIO()
             with contextlib.redirect_stdout(stream):
-                rc = cmd_campaign_job_status(SimpleNamespace(job=str(job)), lab)
+                rc = cmd_campaign_job_status(SimpleNamespace(job=str(job), full=True), lab)
             self.assertEqual(rc, 0)
             payload = json.loads(stream.getvalue())
             self.assertTrue(payload["job"]["runner_lock"]["active"])  # historical stale snapshot retained

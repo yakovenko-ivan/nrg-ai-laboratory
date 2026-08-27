@@ -205,9 +205,15 @@ def rows(cases: Path):
         return list(csv.DictReader(f))
 
 
-def create_runtime_cases(cases: Path):
+def resolved_case_path(row: dict[str, str], lab: Laboratory) -> Path:
+    """Resolve portable case_path exactly as the trusted runtime does."""
+    raw = Path(row["case_path"]).expanduser()
+    return raw.resolve() if raw.is_absolute() else (lab.runs_root / raw).resolve()
+
+
+def create_runtime_cases(cases: Path, lab: Laboratory):
     for row in rows(cases):
-        cp = Path(row["case_path"])
+        cp = resolved_case_path(row, lab)
         (cp / "task_setup").mkdir(parents=True)
         source = cases.parent / "_setups" / f"{row['case_id']}.nml"
         (cp / "setup_input.nml").write_text(source.read_text(), encoding="utf-8")
@@ -268,13 +274,13 @@ class CampaignIdentityAttemptTests(unittest.TestCase):
             definition = root / "campaign.toml"
             campaign_toml(definition, "same_campaign", [1000.0, 1100.0], ["konnov", "keromnes"])
             cases = generate(definition, lab)
-            create_runtime_cases(cases)
+            create_runtime_cases(cases, lab)
 
             first = rows(cases)[0]
             cid = first["case_id"]
-            cp = Path(first["case_path"])
+            cp = resolved_case_path(first, lab)
             original_fp = first["case_fingerprint"]
-            other_paths = [Path(r["case_path"]) for r in rows(cases)[1:]]
+            other_paths = [resolved_case_path(r, lab) for r in rows(cases)[1:]]
 
             overrides = {
                 "physics_config.initial_time_step": 5e-9,
@@ -339,7 +345,7 @@ class CampaignIdentityAttemptTests(unittest.TestCase):
             definition = root / "campaign.toml"
             campaign_toml(definition, "types", [1000.0], ["konnov"])
             cases = generate(definition, lab)
-            create_runtime_cases(cases)
+            create_runtime_cases(cases, lab)
             cid = rows(cases)[0]["case_id"]
             plan = reset_plan(
                 cases, [cid],
@@ -357,7 +363,7 @@ class CampaignIdentityAttemptTests(unittest.TestCase):
             definition = root / "campaign.toml"
             campaign_toml(definition, "blocked", [1000.0, 1100.0], ["konnov"])
             cases = generate(definition, lab)
-            create_runtime_cases(cases)
+            create_runtime_cases(cases, lab)
             cid = rows(cases)[0]["case_id"]
             plan = reset_plan(
                 cases, [cid],

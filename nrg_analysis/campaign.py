@@ -77,10 +77,10 @@ class Campaign:
     ) -> "Campaign":
         """Load a campaign manifest.
 
-        New manifests should contain absolute ``case_path`` values, in which case
-        ``case_root`` is only a harmless fallback.  Older manifests containing
-        relative paths remain supported through ``case_root`` or the legacy
-        keyword ``workspace_root``.
+        New portable manifests should contain relative ``case_path`` values resolved
+        beneath ``case_root``. Absolute paths remain supported for legacy/local
+        manifests, but are generation-environment provenance rather than the
+        preferred portable execution contract.
         """
 
         if case_root is not None and workspace_root is not None:

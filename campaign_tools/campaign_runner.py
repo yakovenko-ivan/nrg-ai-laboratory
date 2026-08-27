@@ -281,6 +281,7 @@ class CampaignRunner:
         self.monitor_log_each_read = bool(self.config.get("monitor_log_each_read", False))
         self.verify_case_fingerprint = bool(self.config.get("verify_case_fingerprint", True))
         self.stop_request_file = str(self.config.get("stop_request_file", "run_control.stop"))
+        self.pause_request_file = str(self.config.get("pause_request_file", "run_control.pause"))
         self.run_control_status_file = str(
             self.config.get("run_control_status_file", "run_control_status.inf")
         )
@@ -323,6 +324,11 @@ class CampaignRunner:
         self.runner_job_id = str(runner_job_id).strip() if runner_job_id else None
         self.control_file = control_file.expanduser().resolve() if control_file else None
         self.campaign_stop_requested = False
+        self.campaign_pause_requested = False
+        self.campaign_restart_required = False
+        self.campaign_halt_requested = False
+        self.pause_after_current_requested = False
+        self.pause_after_current_request: dict[str, Any] | None = None
         self.operator_stop_events: list[dict[str, Any]] = []
 
         self.termination_profile_name = (
@@ -725,6 +731,33 @@ class CampaignRunner:
             return False, True
         return False, False
 
+    def request_graceful_pause(
+        self,
+        process: subprocess.Popen[Any],
+        case_path: Path,
+        reason: str,
+        details: list[str],
+    ) -> tuple[bool, bool]:
+        """Request restartable NRG termination through run_control.pause."""
+        request = case_path / self.pause_request_file
+        request.write_text(
+            "\n".join([f"reason={reason}", f"requested_at={now_text()}", *details]) + "\n",
+            encoding="utf-8",
+        )
+        deadline = time.monotonic() + max(1.0, self.graceful_stop_timeout)
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.25)
+        if process.poll() is not None:
+            return True, False
+        if self.force_kill_on_graceful_timeout:
+            self.force_kill_tree(process)
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
+            return False, True
+        return False, False
+
     def read_operator_control(self) -> dict[str, Any] | None:
         """Return a pending trusted operator-control request for this runner.
 
@@ -746,7 +779,7 @@ class CampaignRunner:
         if self.runner_job_id and target_job and target_job != self.runner_job_id:
             return None
         action = str(payload.get("action", "")).strip().lower()
-        if action not in {"stop_campaign", "stop_case"}:
+        if action not in {"stop_campaign", "stop_case", "pause_campaign", "pause_after_current"}:
             self.update_operator_control(payload, "rejected", reason="unsupported_action")
             return None
         return payload
@@ -767,29 +800,31 @@ class CampaignRunner:
         write_json(path, payload)
 
     def operator_control_before_case(self) -> bool:
-        """Handle a campaign-stop request between cases.
-
-        Returns True when the runner must stop before launching another case.
-        A stop_case request cannot be applied between cases and is rejected so
-        the caller receives an explicit result instead of silently skipping a
-        not-yet-running case.
-        """
+        """Handle trusted control that arrives while no CFD case is active."""
         request = self.read_operator_control()
         if request is None:
             return False
         action = str(request.get("action", "")).lower()
-        if action == "stop_campaign":
-            self.campaign_stop_requested = True
+        if action in {"stop_campaign", "pause_campaign", "pause_after_current"}:
+            if action == "stop_campaign":
+                self.campaign_stop_requested = True
+                outcome = "runner_stopped_between_cases"
+                message = "OPERATOR STOP: campaign runner stopping before next case"
+            else:
+                self.campaign_pause_requested = True
+                self.pause_after_current_requested = action == "pause_after_current"
+                outcome = "runner_paused_between_cases"
+                message = "OPERATOR PAUSE: campaign runner pausing before next case"
             event = {
                 "action": action,
                 "request_id": request.get("request_id"),
                 "case_id": None,
                 "handled_at": now_text(),
-                "outcome": "runner_stopped_between_cases",
+                "outcome": outcome,
             }
             self.operator_stop_events.append(event)
             self.update_operator_control(request, "handled", **event)
-            self.log("OPERATOR STOP: campaign runner stopping before next case")
+            self.log(message)
             return True
         if action == "stop_case":
             self.update_operator_control(
@@ -970,7 +1005,10 @@ class CampaignRunner:
             case_path / "run_external_stop.done",
             case_path / "run_interrupted.done",
             case_path / "run_stopped.done",
+            case_path / "run_paused.done",
+            case_path / "run_pause_failed.done",
             case_path / self.stop_request_file,
+            case_path / self.pause_request_file,
             case_path / self.run_control_status_file,
             case_path / "quasistationary_status.json",
         ]:
@@ -979,7 +1017,9 @@ class CampaignRunner:
             except FileNotFoundError:
                 pass
 
-        self.archive_monitors(case_path)
+        # Preserve compact histories when continuing a restartable case.
+        if previous not in {"paused", "restart_required"}:
+            self.archive_monitors(case_path)
         started_wall = time.monotonic()
         started_text = now_text()
         self.log(f"[{index}/{total}] RUN {case_id}: {label}")
@@ -1111,6 +1151,8 @@ class CampaignRunner:
         last_physical_check_wall = -math.inf
         operator_stop_action: str | None = None
         operator_stop_request: dict[str, Any] | None = None
+        operator_pause_action: str | None = None
+        operator_pause_request: dict[str, Any] | None = None
 
         try:
             while process.poll() is None:
@@ -1121,6 +1163,51 @@ class CampaignRunner:
                 if control is not None:
                     action = str(control.get("action", "")).strip().lower()
                     target_case = str(control.get("case_id") or "").strip()
+
+                    if action == "pause_after_current":
+                        self.campaign_pause_requested = True
+                        self.pause_after_current_requested = True
+                        self.pause_after_current_request = control
+                        operator_pause_request = control
+                        self.update_operator_control(
+                            control,
+                            "acknowledged",
+                            active_case_id=case_id,
+                            acknowledged_at=now_text(),
+                            outcome="pause_queued_after_current",
+                        )
+                        self.log(
+                            f"    OPERATOR PAUSE_AFTER_CURRENT {case_id}: "
+                            "current case will finish normally; no later case will start"
+                        )
+                        continue
+
+                    if action == "pause_campaign":
+                        operator_pause_action = action
+                        operator_pause_request = control
+                        self.campaign_pause_requested = True
+                        self.update_operator_control(
+                            control,
+                            "acknowledged",
+                            active_case_id=case_id,
+                            acknowledged_at=now_text(),
+                        )
+                        self.log(
+                            f"    OPERATOR PAUSE_CAMPAIGN {case_id}: restart checkpoint requested"
+                        )
+                        graceful_requested = True
+                        graceful_completed, force_kill_used = self.request_graceful_pause(
+                            process,
+                            case_path,
+                            "operator:pause_campaign",
+                            [
+                                f"case_id={case_id}",
+                                f"request_id={control.get('request_id', '')}",
+                                f"runner_job_id={self.runner_job_id or ''}",
+                            ],
+                        )
+                        break
+
                     if action == "stop_campaign" or (
                         action == "stop_case" and target_case == case_id
                     ):
@@ -1157,7 +1244,7 @@ class CampaignRunner:
                             active_case_id=case_id,
                         )
 
-                if operator_stop_action is not None:
+                if operator_stop_action is not None or operator_pause_action is not None:
                     break
 
                 if self.max_runtime_seconds > 0 and elapsed >= self.max_runtime_seconds:
@@ -1167,7 +1254,7 @@ class CampaignRunner:
                         f"{self.max_runtime_seconds:g} s"
                     )
                     graceful_requested = True
-                    graceful_completed, force_kill_used = self.request_graceful_stop(
+                    graceful_completed, force_kill_used = self.request_graceful_pause(
                         process,
                         case_path,
                         "runner_timeout",
@@ -1359,6 +1446,76 @@ class CampaignRunner:
             lines += [f"Message: {message}", f"Wall-clock completion time: {end_text}"]
             (case_path / "run_condition_met.done").write_text("\n".join(lines) + "\n", encoding="utf-8")
             self.log(f"CONDITION MET {case_id}: {condition}")
+        elif operator_pause_action == "pause_campaign":
+            pause_verified = (
+                exit_code in self.success_exit_codes
+                and nrg_reason == "external_pause_request"
+                and nrg_restart is True
+                and graceful_completed
+                and not force_kill_used
+            )
+            completed_before_checkpoint = (
+                exit_code in self.success_exit_codes
+                and nrg_reason == "final_simulation_time"
+                and nrg_restart is not True
+            )
+            if pause_verified:
+                run_status = "paused"
+                condition = "operator_campaign_pause"
+                message = "Campaign paused cleanly; NRG wrote and registered a restart checkpoint."
+                (case_path / "run_paused.done").write_text(
+                    f"{message}\nPaused at {end_text}; exit code={exit_code}; "
+                    f"simulation_time_s={nrg_final_time}.\n",
+                    encoding="utf-8",
+                )
+                outcome = "pause_verified"
+            elif completed_before_checkpoint:
+                run_status = "finished"
+                condition = "final_simulation_time"
+                message = (
+                    "Case reached its final simulation time while the pause request was being applied; "
+                    "no restart checkpoint is needed."
+                )
+                (case_path / "run_finished.done").write_text(
+                    f"Finished normally at {end_text}; exit code {exit_code}; "
+                    "pause request coincided with final simulation time.\n",
+                    encoding="utf-8",
+                )
+                outcome = "case_completed_before_pause_checkpoint"
+            else:
+                run_status = "pause_failed"
+                condition = "operator_campaign_pause_unverified"
+                message = (
+                    "Pause request did not produce a verified restart checkpoint; "
+                    "do not assume this case is restartable."
+                )
+                (case_path / "run_pause_failed.done").write_text(
+                    f"{message}\nNRG reason={nrg_reason or 'not_reported'}; "
+                    f"restart_required={nrg_restart}; graceful={graceful_completed}; "
+                    f"force_kill={force_kill_used}.\n",
+                    encoding="utf-8",
+                )
+                outcome = "pause_failed"
+            event = {
+                "action": operator_pause_action,
+                "request_id": (operator_pause_request or {}).get("request_id"),
+                "reason": (operator_pause_request or {}).get("reason"),
+                "case_id": case_id,
+                "handled_at": end_text,
+                "outcome": outcome,
+                "exit_code": exit_code,
+                "nrg_termination_reason": nrg_reason,
+                "nrg_restart_required": nrg_restart,
+                "graceful_stop_completed": graceful_completed,
+                "force_kill_used": force_kill_used,
+            }
+            self.operator_stop_events.append(event)
+            if operator_pause_request is not None:
+                self.update_operator_control(operator_pause_request, "handled", **event)
+            self.log(
+                f"PAUSE RESULT {case_id}: {outcome}; "
+                f"NRG reason={nrg_reason or 'not_reported'}"
+            )
         elif operator_stop_action is not None:
             run_status = "stopped"
             condition = "operator_campaign_stop" if operator_stop_action == "stop_campaign" else "operator_case_stop"
@@ -1391,11 +1548,37 @@ class CampaignRunner:
                 f"NRG reason={nrg_reason or 'not_reported'}"
             )
         elif timed_out:
-            run_status = "timeout"
-            condition = "max_runtime"
-            message = f"Maximum runtime of {self.max_runtime_seconds:g} s exceeded."
-            (case_path / "run_timeout.done").write_text(message + "\n", encoding="utf-8")
-            self.log(f"TIMEOUT {case_id}")
+            timeout_restart_verified = (
+                exit_code in self.success_exit_codes
+                and nrg_reason == "external_pause_request"
+                and nrg_restart is True
+                and graceful_completed
+                and not force_kill_used
+            )
+            if timeout_restart_verified:
+                run_status = "restart_required"
+                condition = "runner_max_runtime"
+                message = (
+                    f"Runner maximum runtime of {self.max_runtime_seconds:g} s was reached; "
+                    "NRG wrote a verified restart checkpoint."
+                )
+                self.campaign_restart_required = True
+                (case_path / "run_restart_required.done").write_text(
+                    f"{message}\nRestart required at {end_text}; "
+                    f"simulation_time_s={nrg_final_time}.\n",
+                    encoding="utf-8",
+                )
+                self.log(f"RESTART REQUIRED {case_id}; runner max runtime")
+            else:
+                run_status = "timeout"
+                condition = "max_runtime"
+                message = (
+                    f"Maximum runtime of {self.max_runtime_seconds:g} s exceeded, "
+                    "but a restart checkpoint was not verified."
+                )
+                self.campaign_halt_requested = True
+                (case_path / "run_timeout.done").write_text(message + "\n", encoding="utf-8")
+                self.log(f"TIMEOUT {case_id}; restart unverified; campaign halted")
         elif exit_code in self.success_exit_codes and nrg_reason == "wall_time_limit" and nrg_restart:
             run_status = "restart_required"
             condition = "wall_time_limit"
@@ -1474,6 +1657,10 @@ class CampaignRunner:
                 "operator_stop_action": operator_stop_action,
                 "operator_stop_request_id": (operator_stop_request or {}).get("request_id"),
                 "operator_stop_reason": (operator_stop_request or {}).get("reason"),
+                "operator_pause_requested": operator_pause_action is not None or self.pause_after_current_requested,
+                "operator_pause_action": operator_pause_action or ("pause_after_current" if self.pause_after_current_requested else None),
+                "operator_pause_request_id": (operator_pause_request or self.pause_after_current_request or {}).get("request_id"),
+                "operator_pause_reason": (operator_pause_request or self.pause_after_current_request or {}).get("reason"),
                 "nrg_termination_reason": nrg_reason,
                 "nrg_restart_required": nrg_restart,
                 "nrg_final_simulation_time_s": nrg_final_time,
@@ -1507,6 +1694,25 @@ class CampaignRunner:
             }
         )
         write_json(status_path, status)
+        if self.pause_after_current_requested and self.pause_after_current_request is not None:
+            request = self.pause_after_current_request
+            event = {
+                "action": "pause_after_current",
+                "request_id": request.get("request_id"),
+                "reason": request.get("reason"),
+                "case_id": case_id,
+                "handled_at": end_text,
+                "outcome": "current_case_completed_runner_paused",
+                "case_status": run_status,
+            }
+            self.operator_stop_events.append(event)
+            self.update_operator_control(request, "handled", **event)
+            self.pause_after_current_request = None
+            self.log(
+                f"PAUSE AFTER CURRENT {case_id}: case_status={run_status}; "
+                "runner will not launch another case"
+            )
+
         self.full_summary()
 
     def recover_interrupted_cases(self) -> int:
@@ -1601,8 +1807,9 @@ class CampaignRunner:
                 f"sha256={self.termination_profile_sha256}"
             )
         self.log(
-            f"Graceful stop request: {self.stop_request_file}; wait "
-            f"{self.graceful_stop_timeout:g} s; force fallback={self.force_kill_on_graceful_timeout}"
+            f"Graceful stop request: {self.stop_request_file}; pause request: "
+            f"{self.pause_request_file}; wait {self.graceful_stop_timeout:g} s; "
+            f"force fallback={self.force_kill_on_graceful_timeout}"
         )
         self.log(f"Case fingerprint verification: {self.verify_case_fingerprint}")
         self.full_summary()
@@ -1610,14 +1817,21 @@ class CampaignRunner:
             if self.operator_control_before_case():
                 break
             self.run_case(index, row)
-            if self.campaign_stop_requested:
+            if (self.campaign_stop_requested or self.campaign_pause_requested or
+                    self.campaign_restart_required or self.campaign_halt_requested):
                 break
         self.full_summary()
-        if self.campaign_stop_requested:
+        if self.campaign_halt_requested:
+            self.log("=== Laboratory-aware NRG campaign run v10 halted after unverified timeout ===")
+        elif self.campaign_restart_required:
+            self.log("=== Laboratory-aware NRG campaign run v10 stopped with restart required ===")
+        elif self.campaign_pause_requested:
+            self.log("=== Laboratory-aware NRG campaign run v10 paused by operator ===")
+        elif self.campaign_stop_requested:
             self.log("=== Laboratory-aware NRG campaign run v10 stopped by operator ===")
         else:
             self.log("=== Laboratory-aware NRG campaign run v10 completed ===")
-        return 0
+        return 2 if self.campaign_halt_requested else 0
 
 
 def update_job_file(path: Path | None, **updates: Any) -> None:
@@ -1671,7 +1885,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--control-file",
         type=Path,
         default=None,
-        help="trusted operator-control JSON file for stop_case/stop_campaign requests",
+        help="trusted operator-control JSON file for stop/pause requests",
     )
     return parser
 
@@ -1718,6 +1932,9 @@ def main() -> int:
             runner_lock.update(
                 exit_code=rc,
                 operator_campaign_stop=runner.campaign_stop_requested,
+                operator_campaign_pause=runner.campaign_pause_requested,
+                campaign_restart_required=runner.campaign_restart_required,
+                campaign_halt_requested=runner.campaign_halt_requested,
             )
     except RunnerAlreadyActive as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1753,7 +1970,13 @@ def main() -> int:
     # retain the earlier "active: true" acquisition-time observation.
     live_lock = probe_runner_lock(lab.campaign_root)
     final_state = (
-        "stopped"
+        "failed"
+        if rc != 0 and "runner" in locals() and runner.campaign_halt_requested
+        else "restart_required"
+        if rc == 0 and "runner" in locals() and runner.campaign_restart_required
+        else "paused"
+        if rc == 0 and "runner" in locals() and runner.campaign_pause_requested
+        else "stopped"
         if rc == 0 and "runner" in locals() and runner.campaign_stop_requested
         else ("completed" if rc == 0 else "failed")
     )

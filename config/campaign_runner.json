@@ -19,5 +19,6 @@
   "run_control_status_file": "run_control_status.inf",
   "graceful_stop_timeout_seconds": 30,
   "force_kill_on_graceful_stop_timeout": true,
-  "monitor_rules": []
+  "monitor_rules": [],
+  "pause_request_file": "run_control.pause"
 }

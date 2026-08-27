@@ -28,6 +28,7 @@ task_setup_template = ".local/NRG/package_interface/task_setup"
 # layout differs (e.g. Visual Studio Release subdirectory).
 computing_module = ".local/NRG/build/bin/computing_module"
 package_interface_0d = ".local/NRG/build/bin/package_interface_0D_ignition_delay_campaign"
+package_interface_1d = ".local/NRG/build/bin/package_interface_1D_wall_flame_campaign"
 
 [execution]
 default_threads = 1

@@ -739,6 +739,110 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "nrg_campaign_export_bundle",
+    label: "NRG Export Execution Bundle",
+    description: "Export a prepared campaign as a self-contained portable execution bundle with relative case locators, standalone runner, pause/resume support, and provenance checks. Requires confirmation because the bundle may be large.",
+    promptSnippet: "Package a prepared NRG campaign for execution on another workstation or cluster login environment",
+    promptGuidelines: [
+      "Use this only after the campaign is generated, audited, and prepared. Export does not launch CFD.",
+      "The exported bundle is an execution artifact: scientific case identity is frozen; only execution.local.toml is machine-local and editable on the compute host.",
+      "After export, report the bundle path and stop. Do not run or poll the remote campaign unless the user explicitly asks and the remote environment is actually accessible.",
+      "The compute host does not need Pi or package-interface executables; it needs Python 3.11+ and a compatible NRG computing_module.",
+    ],
+    parameters: Type.Object({
+      cases: Type.String({ description: "Path to the prepared campaign cases.csv" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["campaign-export-bundle-plan", "--cases", params.cases], signal, 300_000);
+      if (plan.error || !plan.can_export) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "portable bundle export requires interactive confirmation", plan });
+      const mib = Number(plan.estimated_case_bytes ?? 0) / (1024 * 1024);
+      const ok = await ctx.ui.confirm(
+        "Export portable NRG execution bundle?",
+        `Copy ${plan.case_count} prepared case(s) into ${plan.bundle}. Estimated case payload ${mib.toFixed(1)} MiB. No CFD will be launched.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge(["campaign-export-bundle-execute", "--cases", params.cases], signal, 1_800_000));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_campaign_import_results",
+    label: "NRG Import Portable Results",
+    description: "Verify and import a result archive returned from a portable NRG execution bundle into the same logical campaign. Checks bundle/campaign/case fingerprints and file hashes before touching local run data. Requires confirmation.",
+    promptSnippet: "Verify and register CFD results returned from a remote execution host",
+    promptGuidelines: [
+      "Use only for a results archive produced by portable_executor.py pack-results.",
+      "Always run the import plan first and refuse import on campaign-contract, case-fingerprint, unknown-case, or checksum conflicts.",
+      "Import overlays verified execution artifacts onto the same logical cases; it never regenerates or changes scientific case identity.",
+      "After successful import, re-ground campaign status before analysis.",
+    ],
+    parameters: Type.Object({
+      cases: Type.String({ description: "Path to the original local campaign cases.csv" }),
+      results_archive: Type.String({ description: "Path to returned portable results ZIP" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge([
+        "campaign-import-results-plan", "--cases", params.cases,
+        "--results", params.results_archive,
+      ], signal, 1_800_000);
+      if (plan.error || !plan.can_import) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "portable result import requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Import portable NRG results?",
+        `Import verified execution artifacts for ${plan.case_count_in_results} case(s) from bundle ${plan.bundle_id}. Existing scientific case identity is unchanged.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge([
+        "campaign-import-results-execute", "--cases", params.cases,
+        "--results", params.results_archive,
+      ], signal, 1_800_000));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_campaign_pause",
+    label: "NRG Pause Campaign",
+    description: "Pause an active campaign either immediately with a verified NRG restart checkpoint, or after the current case finishes normally. Requires confirmation.",
+    promptSnippet: "Pause an active NRG campaign safely for later continuation",
+    promptGuidelines: [
+      "Use mode=after_current when the current case can be allowed to finish; this avoids a restart and only prevents the next case from launching.",
+      "Use mode=now when the current case must be interrupted. The runner writes run_control.pause and must verify external_pause_request with restart_checkpoint_required=true before status=paused is trusted.",
+      "For mode=after_current, return after the runner acknowledges the queued pause. Do not wait for the CFD case to finish and do not poll unless the user later asks for status.",
+      "Resume by starting the same cases.csv again with the ordinary trusted campaign start path. Do not regenerate the campaign and do not use selective rerun for a normal resume.",
+      "A paused case is incomplete, not scientific success. Completed cases remain untouched and are skipped by ordinary resume policy.",
+    ],
+    parameters: Type.Object({
+      mode: Type.Union([
+        Type.Literal("now"),
+        Type.Literal("after_current"),
+      ], { description: "now = checkpoint and stop active case; after_current = finish active case then stop runner" }),
+      job: Type.Optional(Type.String({ description: "Active runner job id; omit only when there is exactly one live runner" })),
+      reason: Type.Optional(Type.String({ description: "Short operator reason recorded in pause provenance" })),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const planArgs = ["campaign-pause-plan", "--mode", params.mode];
+      if (params.job) planArgs.push("--job", params.job);
+      const plan = await bridge(planArgs, signal);
+      if (plan.error || !plan.can_pause) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "campaign pause requires interactive confirmation", plan });
+      const activeCase = plan.active_case?.case_id ?? "none";
+      const detail = params.mode === "now"
+        ? `Current case ${activeCase} will be checkpointed and stopped; no later case will start.`
+        : `Current case ${activeCase} will continue normally; the runner will stop before the next case.`;
+      const ok = await ctx.ui.confirm(
+        "Pause active NRG campaign?",
+        `Pause runner job ${plan.job_id} using mode=${params.mode}. ${detail}`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["campaign-pause-execute", "--mode", params.mode];
+      if (params.job) execArgs.push("--job", params.job);
+      if (params.reason) execArgs.push("--reason", params.reason);
+      return toolResult(await bridge(execArgs, signal, params.mode === "now" ? 60_000 : 10_000));
+    },
+  });
+
+  pi.registerTool({
     name: "nrg_campaign_stop",
     label: "NRG Stop Campaign",
     description: "Gracefully stop the active trusted campaign runner. If a case is currently running, the runner requests NRG finalization through run_control.stop, records that case as stopped, and exits without launching another case. Requires confirmation.",
@@ -916,6 +1020,9 @@ export default function (pi: ExtensionAPI) {
         "nrg_campaign_start",
         "nrg_campaign_start_to_quasistationary",
         "nrg_campaign_run_cases_to_quasistationary",
+        "nrg_campaign_export_bundle",
+        "nrg_campaign_import_results",
+        "nrg_campaign_pause",
         "nrg_campaign_stop",
         "nrg_case_stop",
         "nrg_study_pilot_plan",

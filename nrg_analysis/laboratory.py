@@ -200,8 +200,8 @@ class Laboratory:
                 package_interfaces[key.removeprefix("package_interface_")] = _resolve_under(
                     value, research_root
                 )
-        if "0d" not in package_interfaces:
-            raise ValueError("laboratory.toml [runtime] requires package_interface_0d")
+        if require_runtime and not package_interfaces:
+            raise ValueError("laboratory.toml [runtime] requires at least one package_interface_* for preparation/full runtime")
 
         default_threads = int(execution.get("default_threads", 1))
         if default_threads <= 0:
@@ -293,21 +293,28 @@ class Laboratory:
                 raise NotADirectoryError(f"{name} is not a directory: {path}")
 
         if require_runtime:
-            # NRG itself is an external dependency of this repository.  The
-            # task_setup tree and executables are validated only when an
-            # execution-ready NRG installation is required.
-            if self.task_setup_template.name != "task_setup":
-                raise ValueError(
-                    "task_setup_template must point to a directory named 'task_setup' "
-                    "because the current package interface expects ./task_setup"
-                )
-            if not self.task_setup_template.is_dir():
-                raise FileNotFoundError(
-                    f"task_setup_template not found: {self.task_setup_template}"
-                )
-            self._validate_executable("computing_module", self.computing_module)
-            for name, path in self.package_interfaces.items():
-                self._validate_executable(f"package_interface_{name}", path)
+            self.validate_preparation_runtime()
+
+    def validate_execution_runtime(self) -> None:
+        """Validate only what an already-prepared campaign needs for CFD execution."""
+        self._validate_executable("computing_module", self.computing_module)
+
+    def validate_preparation_runtime(self) -> None:
+        """Validate package-interface resources plus the CFD executable."""
+        if self.task_setup_template.name != "task_setup":
+            raise ValueError(
+                "task_setup_template must point to a directory named 'task_setup' "
+                "because the current package interface expects ./task_setup"
+            )
+        if not self.task_setup_template.is_dir():
+            raise FileNotFoundError(
+                f"task_setup_template not found: {self.task_setup_template}"
+            )
+        self.validate_execution_runtime()
+        if not self.package_interfaces:
+            raise ValueError("preparation runtime requires at least one package_interface_* executable")
+        for name, path in self.package_interfaces.items():
+            self._validate_executable(f"package_interface_{name}", path)
 
     @staticmethod
     def _validate_executable(name: str, path: Path) -> None:

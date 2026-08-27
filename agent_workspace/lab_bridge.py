@@ -231,7 +231,10 @@ def cmd_case_inspect(args: argparse.Namespace, lab: Laboratory) -> int:
         "run_restart_required.done",
         "run_external_stop.done",
         "run_interrupted.done",
+        "run_paused.done",
+        "run_pause_failed.done",
         "run_control.stop",
+        "run_control.pause",
         "run_control_status.inf",
     )
     markers = [name for name in marker_names if (cp / name).exists()]
@@ -488,11 +491,12 @@ def operator_stop_plan(
         "control_supported": control_supported,
         "laboratory_runner": probe_runner_lock(lab.campaign_root),
         "blockers": blockers,
-        "semantics": (
-            "stop_campaign prevents any further case launch and gracefully stops the current case if one is active"
-            if action == "stop_campaign"
-            else "stop_case gracefully stops only the currently active case; the runner may continue with later cases"
-        ),
+        "semantics": {
+            "stop_campaign": "terminally stops the active case through run_control.stop and prevents later case launch",
+            "stop_case": "terminally stops only the active case through run_control.stop; later cases may run",
+            "pause_campaign": "requests run_control.pause for the active case, verifies a restart checkpoint, and stops the runner",
+            "pause_after_current": "lets the active case finish normally and stops the runner before the next case; no checkpoint is requested",
+        }.get(action, "unknown operator-control action"),
     }
 
 
@@ -534,7 +538,10 @@ def issue_operator_stop(
         current = read_operator_control(control_path)
         if current is not None:
             observed = current
-            if str(current.get("state", "")).lower() in {"handled", "rejected"}:
+            state = str(current.get("state", "")).lower()
+            if state in {"handled", "rejected"}:
+                break
+            if plan["action"] == "pause_after_current" and state == "acknowledged":
                 break
         if plan["action"] == "stop_campaign":
             try:
@@ -552,6 +559,7 @@ def issue_operator_stop(
         "request": request,
         "control": observed,
         "completed": str(observed.get("state", "")).lower() == "handled",
+        "accepted": str(observed.get("state", "")).lower() in {"acknowledged", "handled"},
         "rejected": str(observed.get("state", "")).lower() == "rejected",
         "job": final_job,
         "active_case": final_active_case,
@@ -706,6 +714,182 @@ def cmd_lab_info(args: argparse.Namespace, lab: Laboratory) -> int:
     return emit({"laboratory": lab.to_dict(), "runtime": runtime, "bridge_version": PROJECT_VERSION})
 
 
+
+# NRG compact bridge output schema v1
+#
+# Rich forensic records remain on disk.  These helpers expose only the
+# operational state needed by a caller or agent.  --full restores the previous
+# exhaustive payload for diagnostics.
+
+
+def _compact_runner(runner: dict[str, Any] | None) -> dict[str, Any]:
+    data = runner or {}
+    owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+    result: dict[str, Any] = {"active": bool(data.get("active"))}
+    if owner:
+        if owner.get("runner_pid") is not None:
+            result["pid"] = owner.get("runner_pid")
+        if owner.get("state") is not None:
+            result["state"] = owner.get("state")
+    return result
+
+
+def _compact_active_case(active: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(active, dict):
+        return None
+    status = active.get("run_status") if isinstance(active.get("run_status"), dict) else {}
+    result: dict[str, Any] = {
+        "case_id": active.get("case_id") or status.get("case_id"),
+        "status": status.get("status"),
+    }
+    pid = active.get("process_pid")
+    if pid is None:
+        pid = status.get("process_pid")
+    if pid is not None:
+        result["pid"] = pid
+    if active.get("process_alive") is not None:
+        result["process_alive"] = bool(active.get("process_alive"))
+    if active.get("process_matches_computing_module") is not None:
+        result["trusted_process"] = bool(active.get("process_matches_computing_module"))
+    if active.get("case_path"):
+        result["case_path"] = active.get("case_path")
+    return {k: v for k, v in result.items() if v is not None}
+
+
+def compact_campaign_status(payload: dict[str, Any]) -> dict[str, Any]:
+    invalid = payload.get("invalid_status_cases")
+    problems = {
+        "missing_cases": int(payload.get("missing_cases", 0) or 0),
+        "invalid_status_cases": len(invalid) if isinstance(invalid, list) else int(invalid or 0),
+        "stale_running_cases": int(payload.get("stale_running_cases", 0) or 0),
+    }
+    result: dict[str, Any] = {
+        "ok": "error" not in payload,
+        "cases_csv": payload.get("cases_csv"),
+        "total_cases": int(payload.get("total_cases", 0) or 0),
+        "counts": payload.get("counts", {}),
+        "runnable_cases": int(payload.get("runnable_cases", 0) or 0),
+        "completed_like_cases": int(payload.get("completed_like_cases", 0) or 0),
+        "runner": _compact_runner(payload.get("laboratory_runner")),
+    }
+    if any(problems.values()):
+        result["problems"] = problems
+    if payload.get("error"):
+        result["error"] = payload.get("error")
+    return result
+
+
+def compact_campaign_start(payload: dict[str, Any]) -> dict[str, Any]:
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    return {
+        "ok": "error" not in payload,
+        "job_id": job.get("job_id"),
+        "state": job.get("state"),
+        "runner_pid": job.get("runner_pid"),
+        "cases_csv": job.get("manifest") or status.get("cases_csv"),
+        "cases": {
+            "total": int(status.get("total_cases", 0) or 0),
+            "runnable": int(status.get("runnable_cases", 0) or 0),
+            "counts": status.get("counts", {}),
+        },
+        "references": {
+            "control_file": job.get("control_file"),
+            "stdout_log": job.get("stdout_log"),
+            "stderr_log": job.get("stderr_log"),
+        },
+    }
+
+
+def compact_job_status(payload: dict[str, Any], *, job_file: str | None = None) -> dict[str, Any]:
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    campaign = payload.get("campaign_status") if isinstance(payload.get("campaign_status"), dict) else {}
+    control = payload.get("operator_control") if isinstance(payload.get("operator_control"), dict) else None
+    active = payload.get("active_case") if isinstance(payload.get("active_case"), dict) else None
+    result: dict[str, Any] = {
+        "ok": "error" not in payload,
+        "job_id": job.get("job_id"),
+        "state": job.get("state_observed") or job.get("state"),
+        "runner_active": bool((payload.get("laboratory_runner") or {}).get("active")),
+        "runner_pid": job.get("runner_pid"),
+        "active_case": _compact_active_case(active),
+        "campaign": {
+            "total": int(campaign.get("total_cases", 0) or 0),
+            "counts": campaign.get("counts", {}),
+            "runnable": int(campaign.get("runnable_cases", 0) or 0),
+        },
+        "references": {
+            "job_file": job_file,
+            "stdout_log": job.get("stdout_log"),
+            "stderr_log": job.get("stderr_log"),
+        },
+    }
+    if control:
+        result["operator_control"] = {
+            k: control.get(k)
+            for k in ("action", "state", "case_id", "outcome", "request_id")
+            if control.get(k) is not None
+        }
+    return result
+
+
+def compact_operator_plan(
+    plan: dict[str, Any], *, pause: bool = False, mode: str | None = None
+) -> dict[str, Any]:
+    allowed = bool(plan.get("can_stop"))
+    result: dict[str, Any] = {
+        "ok": "error" not in plan,
+        "action": plan.get("action"),
+        "job_id": plan.get("job_id"),
+        "runner_active": bool((plan.get("laboratory_runner") or {}).get("active")),
+        "active_case": _compact_active_case(plan.get("active_case")),
+        "blockers": plan.get("blockers", []),
+        "semantics": plan.get("semantics"),
+    }
+    if pause:
+        result["mode"] = mode
+        result["can_pause"] = allowed
+    else:
+        result["can_stop"] = allowed
+    if plan.get("error"):
+        result["error"] = plan.get("error")
+    return result
+
+
+def compact_operator_result(result: dict[str, Any]) -> dict[str, Any]:
+    control = result.get("control") if isinstance(result.get("control"), dict) else {}
+    request = result.get("request") if isinstance(result.get("request"), dict) else {}
+    job = result.get("job") if isinstance(result.get("job"), dict) else {}
+    runner = result.get("laboratory_runner") if isinstance(result.get("laboratory_runner"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": "error" not in result,
+        "accepted": bool(result.get("accepted", result.get("completed", False))),
+        "completed": bool(result.get("completed")),
+        "rejected": bool(result.get("rejected")),
+        "job_id": job.get("job_id") or control.get("runner_job_id") or request.get("runner_job_id"),
+        "state": job.get("state"),
+        "runner_active": bool(runner.get("active")),
+        "action": control.get("action") or request.get("action"),
+        "control_state": control.get("state") or request.get("state"),
+        "case_id": control.get("case_id"),
+        "outcome": control.get("outcome"),
+    }
+    nrg = {
+        "reason": control.get("nrg_termination_reason"),
+        "restart_required": control.get("nrg_restart_required"),
+        "exit_code": control.get("exit_code"),
+        "graceful": control.get("graceful_stop_completed"),
+        "force_kill_used": control.get("force_kill_used"),
+    }
+    if any(v is not None for v in nrg.values()):
+        out["nrg"] = nrg
+    if result.get("error"):
+        out["error"] = result.get("error")
+    if not out["completed"] and not out["rejected"]:
+        out["pending"] = True
+    return out
+
+
 def cmd_campaign_status(args: argparse.Namespace, lab: Laboratory) -> int:
     cases = resolve(args.cases)
     # Pi uses the reviewed laboratory runner policy. `--run-config` remains
@@ -715,7 +899,8 @@ def cmd_campaign_status(args: argparse.Namespace, lab: Laboratory) -> int:
         return emit({"error": f"cases.csv not found: {cases}"}, 2)
     if not config.is_file():
         return emit({"error": f"trusted runner configuration not found: {config}"}, 2)
-    return emit(campaign_status_payload(cases, lab, config))
+    payload = campaign_status_payload(cases, lab, config)
+    return emit(payload if getattr(args, "full", False) else compact_campaign_status(payload))
 
 
 def parse_override_items(items: list[str]) -> dict[str, Any]:
@@ -1085,11 +1270,49 @@ def cmd_composite_create(args: argparse.Namespace, lab: Laboratory) -> int:
     return emit(payload, 0 if cp.returncode == 0 else 2)
 
 
+
+def _campaign_problem_kind(campaign: Path) -> str:
+    data = tomllib.loads(campaign.read_text(encoding="utf-8"))
+    defaults = data.get("defaults", {}) if isinstance(data, dict) else {}
+    if not isinstance(defaults, dict):
+        raise ValueError(f"campaign defaults are invalid: {campaign}")
+    if "geometry_config" in defaults or "ignition_config" in defaults:
+        return "1d"
+    if "reactor_config" in defaults:
+        return "0d"
+    raise ValueError(
+        "cannot determine campaign problem kind from defaults; expected reactor_config "
+        "for 0D or geometry_config/ignition_config for 1D"
+    )
+
+
+def campaign_generator_for_definition(campaign: Path, lab: Laboratory) -> Path:
+    kind = _campaign_problem_kind(campaign)
+    name = "campaign_generator_1d_flame.py" if kind == "1d" else "campaign_generator_0d.py"
+    generator = lab.research_root / "campaign_tools" / name
+    if not generator.is_file():
+        raise FileNotFoundError(f"campaign generator not found for {kind}: {generator}")
+    return generator
+
+
+def package_interface_for_generated(cases: Path, lab: Laboratory) -> Path:
+    campaign = cases.parent / "campaign.toml"
+    if not campaign.is_file():
+        raise FileNotFoundError(f"generated campaign definition not found: {campaign}")
+    kind = _campaign_problem_kind(campaign)
+    key = "1d" if kind == "1d" else "0d"
+    try:
+        return lab.package_interfaces[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"laboratory runtime has no package_interface_{key}; add it to the local runtime configuration"
+        ) from exc
+
 def cmd_campaign_preview(args: argparse.Namespace, lab: Laboratory) -> int:
     campaign = resolve_campaign_definition(args.campaign, lab)
     if not campaign.is_file():
         return emit({"error": f"campaign definition not found: {campaign}", "definitions_root": str(campaign_definitions_root(lab))}, 2)
-    generator = lab.research_root / "campaign_tools" / "campaign_generator_0d.py"
+    generator = campaign_generator_for_definition(campaign, lab)
     cmd = [sys.executable, str(generator), str(campaign), "--laboratory", str(lab.config_path), "--preview", "--limit", str(args.limit)]
     cp = subprocess.run(cmd, text=True, capture_output=True, cwd=str(lab.research_root), env=child_env(), check=False)
     payload: dict[str, Any] = {"command": cmd, "exit_code": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
@@ -1106,7 +1329,7 @@ def cmd_campaign_generate(args: argparse.Namespace, lab: Laboratory) -> int:
     campaign = resolve_campaign_definition(args.campaign, lab)
     if not campaign.is_file():
         return emit({"error": f"campaign definition not found: {campaign}", "definitions_root": str(campaign_definitions_root(lab))}, 2)
-    generator = lab.research_root / "campaign_tools" / "campaign_generator_0d.py"
+    generator = campaign_generator_for_definition(campaign, lab)
     mode = "--run-interface" if args.run_interface else "--create"
     cmd = [sys.executable, str(generator), str(campaign), "--laboratory", str(lab.config_path), mode]
     if args.overwrite:
@@ -1130,6 +1353,8 @@ def cmd_campaign_prepare(args: argparse.Namespace, lab: Laboratory) -> int:
     setups_dir = cases.parent / "_setups"
     if not setups_dir.is_dir():
         return emit({"error": f"setup directory not found: {setups_dir}; generate campaign files first"}, 2)
+
+    interface = package_interface_for_generated(cases, lab)
 
     prep_dir = cases.parent / "_preparation"
     prep_dir.mkdir(parents=True, exist_ok=True)
@@ -1203,7 +1428,7 @@ def cmd_campaign_prepare(args: argparse.Namespace, lab: Laboratory) -> int:
         stderr_path = prep_dir / f"{cid}.stderr.log"
         started = utc_now()
         cp_run = subprocess.run(
-            [str(lab.package_interface_0d), str(setup)],
+            [str(interface), str(setup)],
             cwd=str(lab.package_interface_workdir),
             text=True,
             capture_output=True,
@@ -2095,7 +2320,8 @@ def cmd_campaign_start(args: argparse.Namespace, lab: Laboratory) -> int:
         )
     record.update({"state": "running", "runner_pid": proc.pid, "command": command, "launched_at_utc": utc_now()})
     write_json(jp, record)
-    return emit({"job": record, "status": status})
+    payload = {"job": record, "status": status}
+    return emit(payload if getattr(args, "full", False) else compact_campaign_start(payload))
 
 
 def cmd_campaign_job_status(args: argparse.Namespace, lab: Laboratory) -> int:
@@ -2117,7 +2343,8 @@ def cmd_campaign_job_status(args: argparse.Namespace, lab: Laboratory) -> int:
     status = campaign_status_payload(manifest, lab, config if config.is_file() else None) if manifest.is_file() else None
     control_file = Path(str(record.get("control_file") or job_control_path(lab, str(record.get("job_id") or jp.stem)))).expanduser().resolve()
     operator_control = read_operator_control(control_file)
-    return emit({
+    active_case = active_case_for_job(record, lab)
+    payload = {
         "job": record,
         "operator_control": operator_control,
         "laboratory_runner": live_runner,
@@ -2126,19 +2353,122 @@ def cmd_campaign_job_status(args: argparse.Namespace, lab: Laboratory) -> int:
             "job_runner_lock_is_persisted_snapshot": True,
         },
         "campaign_status": status,
-    })
+        "active_case": active_case,
+    }
+    return emit(
+        payload
+        if getattr(args, "full", False)
+        else compact_job_status(payload, job_file=str(jp))
+    )
 
 
 def cmd_campaign_stop_plan(args: argparse.Namespace, lab: Laboratory) -> int:
     plan = operator_stop_plan(lab, action="stop_campaign", job_ref=args.job)
-    return emit(plan, 0 if plan.get("can_stop") else 3)
+    payload = plan if getattr(args, "full", False) else compact_operator_plan(plan)
+    return emit(payload, 0 if plan.get("can_stop") else 3)
 
 
 def cmd_campaign_stop_execute(args: argparse.Namespace, lab: Laboratory) -> int:
     plan = operator_stop_plan(lab, action="stop_campaign", job_ref=args.job)
     result = issue_operator_stop(lab, plan, reason=args.reason, wait_seconds=args.wait_seconds)
-    return emit(result, 0 if not result.get("error") else 3)
+    payload = result if getattr(args, "full", False) else compact_operator_result(result)
+    return emit(payload, 0 if not result.get("error") else 3)
 
+
+
+def cmd_campaign_pause_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    action = "pause_campaign" if args.mode == "now" else "pause_after_current"
+    plan = operator_stop_plan(lab, action=action, job_ref=args.job)
+    payload = plan if getattr(args, "full", False) else compact_operator_plan(
+        plan, pause=True, mode=args.mode
+    )
+    return emit(payload, 0 if plan.get("can_stop") else 3)
+
+
+def cmd_campaign_pause_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    action = "pause_campaign" if args.mode == "now" else "pause_after_current"
+    plan = operator_stop_plan(lab, action=action, job_ref=args.job)
+    wait_seconds = args.wait_seconds if args.mode == "now" else min(args.wait_seconds, 5.0)
+    result = issue_operator_stop(
+        lab,
+        plan,
+        reason=args.reason,
+        wait_seconds=wait_seconds,
+    )
+    payload = result if getattr(args, "full", False) else compact_operator_result(result)
+    return emit(payload, 0 if not result.get("error") else 3)
+
+
+def _portable_bundle_bridge(
+    lab: Laboratory,
+    command: str,
+    *,
+    cases: str,
+    results: str | None = None,
+    output: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    module = lab.research_root / "campaign_tools" / "portable_bundle.py"
+    if not module.is_file():
+        return {"error": f"portable bundle tool not found: {module}"}, 2
+    cmd = [
+        sys.executable,
+        str(module),
+        "--laboratory",
+        str(lab.config_path),
+        command,
+        "--cases",
+        str(resolve(cases)),
+    ]
+    if results is not None:
+        cmd += ["--results", str(resolve(results))]
+    if output is not None:
+        cmd += ["--output", str(resolve(output))]
+    cp = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        cwd=str(lab.research_root),
+        env=child_env(),
+        check=False,
+    )
+    try:
+        payload = json.loads(cp.stdout) if cp.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {"stdout": cp.stdout}
+    if cp.returncode != 0 and "error" not in payload:
+        payload["error"] = f"portable bundle command exited with code {cp.returncode}"
+    if cp.stderr.strip():
+        payload["stderr"] = cp.stderr
+    payload["command_exit_code"] = cp.returncode
+    return payload, cp.returncode
+
+
+def cmd_campaign_export_bundle_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    payload, rc = _portable_bundle_bridge(
+        lab, "export-plan", cases=args.cases, output=args.output
+    )
+    return emit(payload, 0 if rc == 0 and payload.get("can_export") else 3)
+
+
+def cmd_campaign_export_bundle_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    payload, rc = _portable_bundle_bridge(
+        lab, "export", cases=args.cases, output=args.output
+    )
+    return emit(payload, 0 if rc == 0 else 3)
+
+
+def cmd_campaign_import_results_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    payload, rc = _portable_bundle_bridge(
+        lab, "import-plan", cases=args.cases, results=args.results
+    )
+    return emit(payload, 0 if rc == 0 and payload.get("can_import") else 3)
+
+
+def cmd_campaign_import_results_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    payload, rc = _portable_bundle_bridge(
+        lab, "import", cases=args.cases, results=args.results
+    )
+    return emit(payload, 0 if rc == 0 else 3)
 
 def cmd_case_stop_plan(args: argparse.Namespace, lab: Laboratory) -> int:
     cases = resolve(args.cases)
@@ -2147,7 +2477,8 @@ def cmd_case_stop_plan(args: argparse.Namespace, lab: Laboratory) -> int:
     plan = operator_stop_plan(
         lab, action="stop_case", cases=cases, case_id=args.case_id
     )
-    return emit(plan, 0 if plan.get("can_stop") else 3)
+    payload = plan if getattr(args, "full", False) else compact_operator_plan(plan)
+    return emit(payload, 0 if plan.get("can_stop") else 3)
 
 
 def cmd_case_stop_execute(args: argparse.Namespace, lab: Laboratory) -> int:
@@ -2158,7 +2489,8 @@ def cmd_case_stop_execute(args: argparse.Namespace, lab: Laboratory) -> int:
         lab, action="stop_case", cases=cases, case_id=args.case_id
     )
     result = issue_operator_stop(lab, plan, reason=args.reason, wait_seconds=args.wait_seconds)
-    return emit(result, 0 if not result.get("error") else 3)
+    payload = result if getattr(args, "full", False) else compact_operator_result(result)
+    return emit(payload, 0 if not result.get("error") else 3)
 
 
 def _pilot_numeric(value: Any) -> float | None:
@@ -2459,6 +2791,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("campaign-status")
     s.add_argument("--cases", required=True)
     s.add_argument("--run-config")
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("case-inspect")
     s.add_argument("--cases", required=True)
@@ -2515,6 +2848,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("campaign-start")
     s.add_argument("--cases", required=True)
     s.add_argument("--run-config")  # private/manual override; not exposed to Pi
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("campaign-execution-summary")
     s.add_argument("--cases", required=True)
@@ -2551,24 +2885,57 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("campaign-job-status")
     s.add_argument("--job", required=True)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("campaign-stop-plan")
     s.add_argument("--job")
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("campaign-stop-execute")
     s.add_argument("--job")
     s.add_argument("--reason")
     s.add_argument("--wait-seconds", type=float, default=45.0)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
+
+    s = sub.add_parser("campaign-export-bundle-plan")
+    s.add_argument("--cases", required=True)
+    s.add_argument("--output")
+
+    s = sub.add_parser("campaign-export-bundle-execute")
+    s.add_argument("--cases", required=True)
+    s.add_argument("--output")
+
+    s = sub.add_parser("campaign-import-results-plan")
+    s.add_argument("--cases", required=True)
+    s.add_argument("--results", required=True)
+
+    s = sub.add_parser("campaign-import-results-execute")
+    s.add_argument("--cases", required=True)
+    s.add_argument("--results", required=True)
+
+    s = sub.add_parser("campaign-pause-plan")
+    s.add_argument("--job")
+    s.add_argument("--mode", choices=("now", "after_current"), required=True)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
+
+    s = sub.add_parser("campaign-pause-execute")
+    s.add_argument("--job")
+    s.add_argument("--mode", choices=("now", "after_current"), required=True)
+    s.add_argument("--reason")
+    s.add_argument("--wait-seconds", type=float, default=45.0)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("case-stop-plan")
     s.add_argument("--cases", required=True)
     s.add_argument("--case-id", required=True)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("case-stop-execute")
     s.add_argument("--cases", required=True)
     s.add_argument("--case-id", required=True)
     s.add_argument("--reason")
     s.add_argument("--wait-seconds", type=float, default=45.0)
+    s.add_argument("--full", action="store_true", help="return exhaustive diagnostic/provenance payload")
 
     s = sub.add_parser("create-study")
     s.add_argument("--slug", required=True)
@@ -2625,6 +2992,12 @@ def main() -> int:
             "campaign-job-status": cmd_campaign_job_status,
             "campaign-stop-plan": cmd_campaign_stop_plan,
             "campaign-stop-execute": cmd_campaign_stop_execute,
+            "campaign-export-bundle-plan": cmd_campaign_export_bundle_plan,
+            "campaign-export-bundle-execute": cmd_campaign_export_bundle_execute,
+            "campaign-import-results-plan": cmd_campaign_import_results_plan,
+            "campaign-import-results-execute": cmd_campaign_import_results_execute,
+            "campaign-pause-plan": cmd_campaign_pause_plan,
+            "campaign-pause-execute": cmd_campaign_pause_execute,
             "case-stop-plan": cmd_case_stop_plan,
             "case-stop-execute": cmd_case_stop_execute,
             "create-study": cmd_create_study,
