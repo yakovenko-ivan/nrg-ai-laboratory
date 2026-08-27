@@ -10,7 +10,7 @@ This repository supplies the Pi-facing laboratory tools, deterministic campaign
 orchestration, trusted execution/provenance logic, reusable Python analysis, and
 scientific-study workflow needed to conduct CFD/combustion research with NRG.
 
-Current portable-repository release: **v0.6.1**.
+Current portable-repository release: **v0.7.0**.
 
 ## Architecture
 
@@ -148,4 +148,9 @@ nrg-lab-doctor --require-nrg
 nrg-lab-config validate
 ```
 
-See `docs/validation.md`, `docs/release-v0.6.0.md`, and `docs/repository-creation-checklist.md`.
+## User guide
+
+For end-to-end manual and Pi/agentic workflows, see
+[`docs/user-guide.md`](docs/user-guide.md).
+
+See `docs/validation.md`, `docs/release-v0.7.0.md`, and `docs/repository-creation-checklist.md`.
