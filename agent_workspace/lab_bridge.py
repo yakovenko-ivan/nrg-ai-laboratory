@@ -472,8 +472,17 @@ def operator_stop_plan(
         })
     control_path = Path(str(record.get("control_file") or job_control_path(lab, job_id))).expanduser().resolve()
     existing = read_operator_control(control_path)
+    superseded_control: dict[str, Any] | None = None
     if existing and str(existing.get("state", "")).lower() in {"requested", "acknowledged"}:
-        blockers.append({"reason": "operator_stop_already_pending", "control": existing})
+        existing_action = str(existing.get("action", "")).strip().lower()
+        can_supersede = (
+            existing_action == "pause_after_current"
+            and action in {"pause_campaign", "stop_campaign"}
+        )
+        if can_supersede:
+            superseded_control = existing
+        else:
+            blockers.append({"reason": "operator_control_already_pending", "control": existing})
 
     return {
         "can_stop": len(blockers) == 0,
@@ -489,6 +498,7 @@ def operator_stop_plan(
         "requested_case_id": case_id,
         "control_file": str(control_path),
         "control_supported": control_supported,
+        "superseded_control": superseded_control,
         "laboratory_runner": probe_runner_lock(lab.campaign_root),
         "blockers": blockers,
         "semantics": {
@@ -522,6 +532,13 @@ def issue_operator_stop(
         "reason": reason or "explicit_user_request",
         "source": "trusted_lab_bridge",
     }
+    superseded = plan.get("superseded_control")
+    if isinstance(superseded, dict):
+        request["supersedes"] = {
+            "request_id": superseded.get("request_id"),
+            "action": superseded.get("action"),
+            "state": superseded.get("state"),
+        }
     write_json(control_path, request)
 
     jp = Path(str(plan["job_file"])).expanduser().resolve()
@@ -846,6 +863,13 @@ def compact_operator_plan(
         "blockers": plan.get("blockers", []),
         "semantics": plan.get("semantics"),
     }
+    superseded = plan.get("superseded_control")
+    if isinstance(superseded, dict):
+        result["supersedes"] = {
+            "request_id": superseded.get("request_id"),
+            "action": superseded.get("action"),
+            "state": superseded.get("state"),
+        }
     if pause:
         result["mode"] = mode
         result["can_pause"] = allowed

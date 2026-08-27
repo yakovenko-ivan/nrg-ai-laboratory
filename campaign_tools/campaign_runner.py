@@ -799,6 +799,34 @@ class CampaignRunner:
         payload["updated_at"] = now_text()
         write_json(path, payload)
 
+    def supersede_pause_after_current(
+        self,
+        new_action: str,
+        new_request: dict[str, Any],
+    ) -> None:
+        # Cancel queued after-current state before a stronger request.
+        if not self.pause_after_current_requested:
+            return
+        previous = self.pause_after_current_request or {}
+        event = {
+            "action": "pause_after_current",
+            "request_id": previous.get("request_id"),
+            "reason": previous.get("reason"),
+            "case_id": previous.get("active_case_id"),
+            "handled_at": now_text(),
+            "outcome": f"superseded_by_{new_action}",
+            "superseded_by_request_id": new_request.get("request_id"),
+        }
+        self.operator_stop_events.append(event)
+        self.pause_after_current_requested = False
+        self.pause_after_current_request = None
+        if new_action == "stop_campaign":
+            self.campaign_pause_requested = False
+        self.log(
+            "    OPERATOR CONTROL: queued PAUSE_AFTER_CURRENT superseded by "
+            f"{new_action.upper()}"
+        )
+
     def operator_control_before_case(self) -> bool:
         """Handle trusted control that arrives while no CFD case is active."""
         request = self.read_operator_control()
@@ -1183,6 +1211,7 @@ class CampaignRunner:
                         continue
 
                     if action == "pause_campaign":
+                        self.supersede_pause_after_current(action, control)
                         operator_pause_action = action
                         operator_pause_request = control
                         self.campaign_pause_requested = True
@@ -1211,6 +1240,8 @@ class CampaignRunner:
                     if action == "stop_campaign" or (
                         action == "stop_case" and target_case == case_id
                     ):
+                        if action == "stop_campaign":
+                            self.supersede_pause_after_current(action, control)
                         operator_stop_action = action
                         operator_stop_request = control
                         if action == "stop_campaign":
