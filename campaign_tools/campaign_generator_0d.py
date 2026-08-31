@@ -77,6 +77,8 @@ GROUP_KEYS: dict[str, set[str]] = {
     },
     "physics_config": {
         "mechanism_id",
+        "thermo_data_file",
+        "transport_data_file",
         "solver_id",
         "initial_time_step",
         "cfl_enabled",
@@ -114,7 +116,80 @@ ALLOWED_SOLVERS = {
     "fds",
     "fds_low_mach",
 }
-ALLOWED_MECHANISMS = {"keromnes", "konnov", "zhang", "agafonov", "tereza"}
+ALLOWED_MECHANISMS = {
+    "keromnes", "konnov", "zhang", "gerasimov_shatalov2013", "popov2007",
+    "maas_pope1992", "li2004", "williams2004", "gri_mech3", "tereza", "hong2010",
+}
+
+MECHANISM_FILES: dict[str, str] = {
+    "keromnes": "KEROMNES.txt",
+    "konnov": "KONNOV.txt",
+    "zhang": "ZHANG.txt",
+    "gerasimov_shatalov2013": "GERASIMOV_SHATALOV_2013_NRG_noREV.txt",
+    "popov2007": "POPOV_2007_H2_O2_NRG.txt",
+    "maas_pope1992": "MAAS_POPE_1992_H2_NRG_noREV.txt",
+    "li2004": "LI_ZHAO_KAZAKOV_DRYER_2004_checked_N2.txt",
+    "williams2004": "WILLIAMS_2004.txt",
+    "gri_mech3": "GRI_MECH_3_H2_checked_original.txt",
+    "tereza": "TEREZA_orig.txt",
+    "hong2010": "HONG_2010_TABLE7_checked.txt",
+}
+
+
+def _resolve_task_setup_resource(task_setup: Path, preferred_subdir: str, filename: str) -> Path:
+    direct = task_setup / preferred_subdir / filename
+    if direct.is_file():
+        return direct.resolve()
+    matches = [p.resolve() for p in task_setup.rglob(filename) if p.is_file()]
+    if not matches:
+        raise FileNotFoundError(f"task_setup resource not found: {filename}")
+    if len(matches) != 1:
+        raise ValueError(f"task_setup resource is ambiguous: {filename}: {matches}")
+    return matches[0]
+
+
+def task_setup_resource_provenance(cases: list[dict[str, Any]], laboratory: Laboratory) -> dict[str, Any]:
+    task_setup = laboratory.task_setup_template.resolve()
+    if not task_setup.is_dir():
+        raise FileNotFoundError(f"task_setup template not found: {task_setup}")
+    mechanism_ids = sorted({
+        str(item["groups"]["physics_config"]["mechanism_id"]).lower() for item in cases
+    })
+    kinetic: dict[str, Any] = {}
+    for mechanism_id in mechanism_ids:
+        try:
+            filename = MECHANISM_FILES[mechanism_id]
+        except KeyError as exc:
+            raise ValueError(f"no kinetic-file provenance mapping for {mechanism_id!r}") from exc
+        path = _resolve_task_setup_resource(task_setup, "chemical_mechanisms", filename)
+        kinetic[mechanism_id] = {
+            "relative_path": path.relative_to(task_setup).as_posix(),
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+
+    thermo_names: set[str] = {"molar_masses.dat"}
+    for item in cases:
+        phy = item["groups"]["physics_config"]
+        for key in ("thermo_data_file", "transport_data_file"):
+            value = str(phy.get(key, "")).strip()
+            if value:
+                thermo_names.add(value)
+    thermo: dict[str, Any] = {}
+    for filename in sorted(thermo_names):
+        path = _resolve_task_setup_resource(task_setup, "thermophysical_data", filename)
+        thermo[filename] = {
+            "relative_path": path.relative_to(task_setup).as_posix(),
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+    return {
+        "resource_root": str(task_setup),
+        "absolute_resource_root_authoritative": False,
+        "kinetic_mechanisms": kinetic,
+        "thermophysical_data": thermo,
+    }
+
 
 GENERATOR_SCHEMA_VERSION = 3
 FINGERPRINT_HEX_LENGTH = 32
@@ -278,6 +353,9 @@ def validate_case(groups: dict[str, dict[str, Any]]) -> None:
         raise ValueError(f"unsupported mechanism_id {mechanism!r}")
     if solver not in ALLOWED_SOLVERS:
         raise ValueError(f"unsupported solver_id {solver!r}")
+    for key in ("thermo_data_file", "transport_data_file"):
+        if key in phy and (not isinstance(phy[key], str) or not phy[key].strip()):
+            raise ValueError(f"{key} must be a non-empty string when provided")
     if float(phy["initial_time_step"]) <= 0:
         raise ValueError("initial_time_step must be positive")
     cfl = float(phy["cfl_coefficient"])
@@ -298,7 +376,7 @@ def validate_case(groups: dict[str, dict[str, Any]]) -> None:
     for key in ("postprocess_interval_us", "field_save_interval_us", "checkpoint_interval_us"):
         if float(out[key]) <= 0:
             raise ValueError(f"{key} must be positive")
-
+            
 
 def canonical_scientific_payload(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
@@ -625,6 +703,7 @@ def create_files(data: dict[str, Any], toml_path: Path, cases: list[dict[str, An
         "generated_attempt_fingerprints": {
             x["case_id"]: x.get("generated_attempt_fingerprint") for x in cases
         },
+        "task_setup_resources": task_setup_resource_provenance(cases, laboratory),
     }
     (out_dir / "campaign_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"

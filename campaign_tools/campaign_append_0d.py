@@ -27,6 +27,7 @@ from campaign_tools.campaign_generator_0d import (
     flatten_case,
     read_campaign,
     render_namelist,
+    task_setup_resource_provenance,
 )
 from campaign_tools.campaign_identity import (
     attempt_fingerprint,
@@ -316,6 +317,18 @@ def append(cases_csv: Path, revised_toml: Path, lab: Laboratory) -> dict[str, An
     manifest["case_identity_fingerprints"] = {
         row["case_id"]: row["case_identity_fingerprint"] for row in rows
     }
+
+    # Rebuild scientific-resource provenance from the complete post-append
+    # campaign, not only from the original base generation.
+    all_cases_for_provenance = [
+        {"groups": load_base_groups(cases_csv, str(row["case_id"]).strip())}
+        for row in rows
+    ]
+    manifest["task_setup_resources"] = task_setup_resource_provenance(
+        all_cases_for_provenance,
+        lab,
+    )
+
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     return {

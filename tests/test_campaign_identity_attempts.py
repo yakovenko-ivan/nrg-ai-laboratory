@@ -30,6 +30,7 @@ from campaign_tools.campaign_identity import (
     validate_overrides,
 )
 from nrg_analysis.laboratory import Laboratory
+from nrg_analysis.provenance import sha256_file
 
 
 def make_lab(root: Path) -> Laboratory:
@@ -42,6 +43,19 @@ def make_lab(root: Path) -> Laboratory:
         root / "config",
     ):
         p.mkdir(parents=True, exist_ok=True)
+
+    # Generation-time scientific provenance now hashes the actual
+    # task_setup resources used by each generated campaign.  This synthetic
+    # Laboratory therefore needs minimal stand-ins for the mechanisms exercised
+    # by this test module and for the always-recorded molar-mass database.
+    chemistry = root / "resources" / "task_setup" / "chemical_mechanisms"
+    thermo = root / "resources" / "task_setup" / "thermophysical_data"
+    chemistry.mkdir(parents=True, exist_ok=True)
+    thermo.mkdir(parents=True, exist_ok=True)
+    (chemistry / "KONNOV.txt").write_text("synthetic KONNOV mechanism\n", encoding="utf-8")
+    (chemistry / "KEROMNES.txt").write_text("synthetic KEROMNES mechanism\n", encoding="utf-8")
+    (chemistry / "ZHANG.txt").write_text("synthetic ZHANG mechanism\n", encoding="utf-8")
+    (thermo / "molar_masses.dat").write_text("synthetic molar masses\n", encoding="utf-8")
 
     computing = root / "bin" / "computing_module"
     computing.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -225,6 +239,68 @@ def create_runtime_cases(cases: Path, lab: Laboratory):
 
 
 class CampaignIdentityAttemptTests(unittest.TestCase):
+
+    def test_append_rebuilds_task_setup_resource_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lab = make_lab(root)
+
+            base_def = root / "base_provenance.toml"
+            campaign_toml(
+                base_def,
+                "append_provenance",
+                [1000.0],
+                ["konnov"],
+                explicit_identity=True,
+            )
+            cases = generate(base_def, lab)
+
+            before = json.loads(
+                (cases.parent / "campaign_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(before["task_setup_resources"]["kinetic_mechanisms"]),
+                {"konnov"},
+            )
+
+            revised_def = root / "append_provenance.toml"
+            campaign_toml(
+                revised_def,
+                "append_provenance",
+                [1100.0],
+                ["keromnes"],
+                explicit_identity=True,
+            )
+            result = append_campaign(cases, revised_def, lab)
+            self.assertEqual(result["appended_case_count"], 1)
+
+            after = json.loads(
+                (cases.parent / "campaign_manifest.json").read_text(encoding="utf-8")
+            )
+            resources = after["task_setup_resources"]
+            kinetic = resources["kinetic_mechanisms"]
+            self.assertEqual(set(kinetic), {"konnov", "keromnes"})
+
+            expected_files = {
+                "konnov": "KONNOV.txt",
+                "keromnes": "KEROMNES.txt",
+            }
+            for mechanism_id, filename in expected_files.items():
+                entry = kinetic[mechanism_id]
+                resource = lab.task_setup_template / entry["relative_path"]
+                self.assertTrue(resource.is_file())
+                self.assertEqual(resource.name, filename)
+                self.assertEqual(entry["sha256"], sha256_file(resource))
+                self.assertEqual(entry["size"], resource.stat().st_size)
+
+            thermo = resources["thermophysical_data"]
+            self.assertIn("molar_masses.dat", thermo)
+            molar = lab.task_setup_template / thermo["molar_masses.dat"]["relative_path"]
+            self.assertEqual(
+                thermo["molar_masses.dat"]["sha256"],
+                sha256_file(molar),
+            )
+
     def test_duplicate_logical_identity_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
