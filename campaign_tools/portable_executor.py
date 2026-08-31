@@ -148,8 +148,12 @@ def read_config(path: Path) -> dict[str, Any]:
         data = tomllib.load(stream)
     runtime = data.get("runtime", {})
     execution = data.get("execution", {})
+    termination = data.get("termination", {})
     if not isinstance(runtime, dict) or not isinstance(execution, dict):
         raise ValueError("execution config requires [runtime] and [execution] tables")
+    if not isinstance(termination, dict):
+        raise ValueError("[termination] must be a TOML table")
+
     raw_exe = str(runtime.get("computing_module", "")).strip()
     if not raw_exe or raw_exe == "CHANGE_ME":
         raise ValueError("set [runtime].computing_module in execution.local.toml")
@@ -160,12 +164,28 @@ def read_config(path: Path) -> dict[str, Any]:
         exe = exe.resolve()
     if not exe.is_file():
         raise FileNotFoundError(f"computing_module not found: {exe}")
+
     threads = int(execution.get("threads", 1))
     if threads <= 0:
         raise ValueError("execution.threads must be positive")
     backend = str(execution.get("backend", "local")).strip().lower()
     if backend != "local":
         raise ValueError("portable executor v1 currently supports backend='local' only")
+
+    profile_name = str(termination.get("profile_name", "")).strip()
+    registry_path: Path | None = None
+    if profile_name:
+        raw_registry = str(termination.get("profile_registry", "termination_profiles.json")).strip()
+        if not raw_registry:
+            raise ValueError("termination.profile_registry must not be empty when profile_name is set")
+        registry_path = Path(os.path.expandvars(raw_registry)).expanduser()
+        if not registry_path.is_absolute():
+            registry_path = (path.parent / registry_path).resolve()
+        else:
+            registry_path = registry_path.resolve()
+        if not registry_path.is_file():
+            raise FileNotFoundError(f"termination profile registry not found: {registry_path}")
+
     return {
         "path": path.resolve(),
         "computing_module": exe,
@@ -179,6 +199,8 @@ def read_config(path: Path) -> dict[str, Any]:
         "continue_on_failure": bool(execution.get("continue_on_failure", False)),
         "limit_library_threads": bool(execution.get("limit_library_threads", True)),
         "require_exact_binary": bool(runtime.get("require_exact_binary", False)),
+        "termination_profile_name": profile_name or None,
+        "termination_profile_registry": registry_path,
     }
 
 
@@ -214,6 +236,14 @@ def verify_export_snapshot(bundle_root: Path) -> list[str]:
     return verify_checksum_file(bundle_root, "EXPORT_SNAPSHOT_CHECKSUMS.sha256")
 
 
+
+def _has_initial_data_output(case_path: Path) -> bool:
+    """Return True when data_output contains at least one file at any depth."""
+    data_output = case_path / "data_output"
+    return data_output.is_dir() and any(
+        path.is_file() for path in data_output.rglob("*")
+    )
+
 def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     manifest_path = bundle_root / "bundle_manifest.json"
     if not manifest_path.is_file():
@@ -246,8 +276,21 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
         if not (cp / "task_setup").is_dir():
             case_problems.append(f"{cid}: task_setup directory missing")
         data_output = cp / "data_output"
-        if not data_output.is_dir() or not any(path.is_file() for path in data_output.iterdir()):
+        if not _has_initial_data_output(cp):
             case_problems.append(f"{cid}: initial/restart data_output state missing")
+
+    termination_problems: list[str] = []
+    termination_meta: dict[str, Any] | None = None
+    if config.get("termination_profile_name"):
+        try:
+            selected = resolve_termination(bundle_root, config, manifest)
+            assert selected is not None
+            termination_meta = {
+                key: value for key, value in selected.items()
+                if key not in {"module", "profile"}
+            }
+        except Exception as exc:
+            termination_problems.append(str(exc))
 
     exe_sha = sha256_file(config["computing_module"])
     expected_sha = str(
@@ -261,7 +304,7 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
         )
 
     return {
-        "valid": not static_problems and not snapshot_problems and not case_problems,
+        "valid": not static_problems and not snapshot_problems and not case_problems and not termination_problems,
         "bundle_id": manifest.get("bundle_id"),
         "campaign_contract_sha256": manifest.get("campaign_contract_sha256"),
         "case_count": len(rows),
@@ -269,6 +312,8 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
         "export_snapshot_checked": first_execution,
         "export_snapshot_integrity_problems": snapshot_problems,
         "case_contract_problems": case_problems,
+        "termination_integrity_problems": termination_problems,
+        "termination": termination_meta,
         "runtime": {
             "computing_module": str(config["computing_module"]),
             "computing_module_sha256": exe_sha,
@@ -278,6 +323,75 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
             "threads": config["threads"],
             "backend": config["backend"],
         },
+    }
+
+
+def _load_verified_qs_module(bundle_root: Path, manifest: dict[str, Any]):
+    """Verify the bundled evaluator before importing/executing it."""
+    import importlib.util
+
+    info = manifest.get("termination") or {}
+    expected = str(info.get("quasistationary_core_sha256") or "").strip()
+    core_path = bundle_root / "quasistationary_core.py"
+    if not expected:
+        raise ValueError("bundle manifest does not record quasistationary_core_sha256")
+    if not core_path.is_file():
+        raise FileNotFoundError(f"bundled quasistationarity evaluator missing: {core_path}")
+    observed = sha256_file(core_path)
+    if observed != expected:
+        raise ValueError(
+            "bundled quasistationarity evaluator checksum mismatch: "
+            f"expected={expected}, observed={observed}"
+        )
+    spec = importlib.util.spec_from_file_location("nrg_portable_quasistationary_core", core_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load bundled quasistationarity evaluator: {core_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module, observed
+
+
+def resolve_termination(
+    bundle_root: Path,
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve the selected execution profile and record override provenance.
+
+    The bundle carries a reviewed default registry.  execution.local.toml may
+    deliberately select another profile or another registry; the exact selected
+    registry and profile are hashed and recorded in each run status.
+    """
+    name = config.get("termination_profile_name")
+    if not name:
+        return None
+    registry = config.get("termination_profile_registry")
+    if not isinstance(registry, Path) or not registry.is_file():
+        raise FileNotFoundError(f"selected termination registry not found: {registry}")
+
+    module, core_sha = _load_verified_qs_module(bundle_root, manifest)
+    profile = module.load_profile(registry, str(name))
+    registry_sha = sha256_file(registry)
+    profile_sha = module.profile_sha256(profile)
+    bundled = manifest.get("termination") or {}
+    default_name = str(bundled.get("default_profile") or "").strip() or None
+    default_registry_sha = str(bundled.get("profile_registry_sha256") or "").strip() or None
+    override = bool(
+        (default_name and str(name) != default_name)
+        or (default_registry_sha and registry_sha != default_registry_sha)
+    )
+    return {
+        "module": module,
+        "profile": profile,
+        "profile_name": str(name),
+        "profile_sha256": profile_sha,
+        "profile_parameters": profile.to_registry_mapping(),
+        "profile_registry": str(registry),
+        "profile_registry_sha256": registry_sha,
+        "quasistationary_core_sha256": core_sha,
+        "bundle_default_profile": default_name,
+        "override_applied": override,
     }
 
 
@@ -366,6 +480,7 @@ def clean_runtime_markers(cp: Path) -> None:
         "run_control.stop",
         "run_control_status.inf",
         "run_finished.done",
+        "run_condition_met.done",
         "run_paused.done",
         "run_pause_failed.done",
         "run_restart_required.done",
@@ -417,6 +532,10 @@ def run_case(
     previous_status = str((previous or {}).get("status", "not_started")).lower()
     clean_runtime_markers(cp)
 
+    termination = config.get("_termination_runtime")
+    profile = termination.get("profile") if isinstance(termination, dict) else None
+    qs_module = termination.get("module") if isinstance(termination, dict) else None
+
     started = utc_now()
     exe_sha = sha256_file(config["computing_module"])
     status: dict[str, Any] = {
@@ -442,6 +561,17 @@ def run_case(
         "nrg_final_simulation_time_s": None,
         "termination_condition": None,
         "termination_message": None,
+        "termination_profile": termination.get("profile_name") if termination else None,
+        "termination_profile_sha256": termination.get("profile_sha256") if termination else None,
+        "termination_profile_parameters": termination.get("profile_parameters") if termination else None,
+        "termination_profile_registry": termination.get("profile_registry") if termination else None,
+        "termination_profile_registry_sha256": termination.get("profile_registry_sha256") if termination else None,
+        "quasistationary_core_sha256": termination.get("quasistationary_core_sha256") if termination else None,
+        "termination_override_applied": termination.get("override_applied") if termination else None,
+        "physical_condition_met": False if termination else None,
+        "physical_condition_status": None,
+        "physical_condition": None,
+        "product_state": None,
     }
     write_json(cp / "run_status.json", status)
 
@@ -467,60 +597,107 @@ def run_case(
         pause_request: dict[str, Any] | None = None
         campaign_pause_after_current = False
         terminal_stop = False
+        physical_triggered = False
+        physical_result: dict[str, Any] | None = None
+        physical_stop_requested_at: str | None = None
+        last_physical_check = -1.0e300
+
         while process.poll() is None:
             time.sleep(config["poll_seconds"])
             request = read_pending_control(root)
-            if request is None:
-                continue
-            action = str(request.get("action", "")).lower()
-            if action == "pause_after_current":
-                campaign_pause_after_current = True
-                pause_request = request
-                update_control(
-                    root,
-                    request,
-                    "acknowledged",
-                    active_case_id=cid,
-                    outcome="pause_queued_after_current",
-                )
-                # Keep running to natural completion.
-                continue
-            if action == "pause_now":
-                pause_action = action
-                pause_request = request
-                update_control(root, request, "acknowledged", active_case_id=cid)
-                (cp / "run_control.pause").write_text(
-                    f"reason=portable_executor_pause\nrequested_at={utc_now()}\n",
-                    encoding="utf-8",
-                )
-                stopped = wait_for_process_stop(process, config["graceful_pause_timeout_seconds"])
-                if not stopped:
+            if request is not None:
+                action = str(request.get("action", "")).lower()
+                if action == "pause_after_current":
+                    campaign_pause_after_current = True
+                    pause_request = request
                     update_control(
-                        root,
-                        request,
-                        "rejected",
-                        reason="nrg_did_not_honor_pause_before_timeout",
-                        active_case_id=cid,
+                        root, request, "acknowledged", active_case_id=cid,
+                        outcome="pause_queued_after_current",
                     )
-                    raise RuntimeError(
-                        f"NRG did not honor pause for {cid} within "
-                        f"{config['graceful_pause_timeout_seconds']} s; process left running"
+                elif action == "pause_now":
+                    pause_action = action
+                    pause_request = request
+                    update_control(root, request, "acknowledged", active_case_id=cid)
+                    (cp / "run_control.pause").write_text(
+                        f"reason=portable_executor_pause\nrequested_at={utc_now()}\n",
+                        encoding="utf-8",
                     )
-                break
-            if action == "stop":
-                terminal_stop = True
-                pause_request = request
-                update_control(root, request, "acknowledged", active_case_id=cid)
-                (cp / "run_control.stop").write_text(
-                    f"reason=portable_executor_stop\nrequested_at={utc_now()}\n",
-                    encoding="utf-8",
+                    stopped = wait_for_process_stop(process, config["graceful_pause_timeout_seconds"])
+                    if not stopped:
+                        update_control(
+                            root, request, "rejected",
+                            reason="nrg_did_not_honor_pause_before_timeout",
+                            active_case_id=cid,
+                        )
+                        raise RuntimeError(
+                            f"NRG did not honor pause for {cid} within "
+                            f"{config['graceful_pause_timeout_seconds']} s; process left running"
+                        )
+                    break
+                elif action == "stop":
+                    terminal_stop = True
+                    pause_request = request
+                    update_control(root, request, "acknowledged", active_case_id=cid)
+                    (cp / "run_control.stop").write_text(
+                        f"reason=portable_executor_stop\nrequested_at={utc_now()}\n",
+                        encoding="utf-8",
+                    )
+                    stopped = wait_for_process_stop(process, config["graceful_pause_timeout_seconds"])
+                    if not stopped:
+                        update_control(root, request, "rejected", reason="nrg_did_not_stop_before_timeout")
+                        raise RuntimeError(f"NRG did not honor terminal stop for {cid}")
+                    break
+                else:
+                    update_control(root, request, "rejected", reason="unsupported_action")
+
+            if process.poll() is not None or profile is None or qs_module is None:
+                continue
+            now_wall = time.monotonic()
+            if now_wall - last_physical_check < profile.check_wall_interval_s:
+                continue
+            last_physical_check = now_wall
+            try:
+                qs = qs_module.evaluate_case(cp, profile)
+            except FileNotFoundError:
+                # Reactor history may not exist during initial solver startup.
+                continue
+            except qs_module.TransientHistoryError:
+                # A concurrently appended final record may be incomplete; retry.
+                continue
+            except Exception as exc:
+                raise RuntimeError(f"physical termination monitor failed for {cid}: {exc}") from exc
+
+            physical_result = qs.to_dict()
+            write_json(
+                cp / "quasistationary_status.json",
+                {
+                    "observed_at_utc": utc_now(),
+                    "profile": termination["profile_name"],
+                    "profile_sha256": termination["profile_sha256"],
+                    "profile_registry_sha256": termination["profile_registry_sha256"],
+                    "quasistationary_core_sha256": termination["quasistationary_core_sha256"],
+                    **physical_result,
+                },
+            )
+            if not qs.reached:
+                continue
+
+            physical_triggered = True
+            physical_stop_requested_at = utc_now()
+            (cp / "run_control.stop").write_text(
+                f"reason=physical:{termination['profile_name']}\n"
+                f"requested_at={physical_stop_requested_at}\n"
+                f"condition={termination['profile_name']}\n"
+                f"simulation_time_s={qs.history_end_time_s}\n",
+                encoding="utf-8",
+            )
+            stopped = wait_for_process_stop(process, config["graceful_pause_timeout_seconds"])
+            if not stopped:
+                raise RuntimeError(
+                    f"NRG did not honor physical stop for {cid} within "
+                    f"{config['graceful_pause_timeout_seconds']} s"
                 )
-                stopped = wait_for_process_stop(process, config["graceful_pause_timeout_seconds"])
-                if not stopped:
-                    update_control(root, request, "rejected", reason="nrg_did_not_stop_before_timeout")
-                    raise RuntimeError(f"NRG did not honor terminal stop for {cid}")
-                break
-            update_control(root, request, "rejected", reason="unsupported_action")
+            break
 
         exit_code = process.wait()
 
@@ -538,11 +715,48 @@ def run_case(
             "nrg_restart_required": restart,
             "nrg_final_simulation_time_s": final_sim,
             "nrg_elapsed_wall_time_s": core.get("elapsed_wall_time_s"),
+            "physical_condition_met": physical_triggered if termination else None,
+            "physical_condition_status": physical_result.get("status") if physical_result else None,
+            "physical_condition": physical_result,
         }
     )
+    if physical_triggered and physical_result:
+        status["product_state"] = {
+            "temperature_K": physical_result.get("product_temperature_K"),
+            "pressure_Pa": physical_result.get("product_pressure_Pa"),
+            "density_kg_m3": physical_result.get("product_density_kg_m3"),
+            "species_mass_fractions": physical_result.get("product_species_mass_fractions", {}),
+            "averaging_window_start_s": physical_result.get("window_start_time_s"),
+            "averaging_window_end_s": physical_result.get("window_end_time_s"),
+        }
 
     must_pause_runner = False
-    if pause_action == "pause_now":
+    if physical_triggered:
+        graceful = exit_code == 0 and reason == "external_stop_request"
+        if graceful:
+            status.update(
+                status="condition_met",
+                termination_condition=termination["profile_name"],
+                termination_message="Post-ignition quasistationary product-state condition met.",
+            )
+            (cp / "run_condition_met.done").write_text(
+                f"Condition: {termination['profile_name']}\n"
+                f"Requested at: {physical_stop_requested_at}\n"
+                f"Simulation time [s]: {physical_result.get('history_end_time_s')}\n",
+                encoding="utf-8",
+            )
+        else:
+            status.update(
+                status="failed",
+                termination_condition="physical_condition_met_but_stop_unverified",
+                termination_message=(
+                    "Physical condition was reached, but NRG did not complete the expected "
+                    f"graceful external-stop contract (reason={reason}, exit_code={exit_code})."
+                ),
+            )
+            (cp / "run_failed.done").write_text(status["termination_message"] + "\n", encoding="utf-8")
+            must_pause_runner = not config["continue_on_failure"]
+    elif pause_action == "pause_now":
         verified = exit_code == 0 and reason == "external_pause_request" and restart is True
         if verified:
             status.update(
@@ -567,13 +781,8 @@ def run_case(
             outcome = "pause_failed"
         if pause_request is not None:
             update_control(
-                root,
-                pause_request,
-                "handled",
-                active_case_id=cid,
-                outcome=outcome,
-                nrg_termination_reason=reason,
-                nrg_restart_required=restart,
+                root, pause_request, "handled", active_case_id=cid, outcome=outcome,
+                nrg_termination_reason=reason, nrg_restart_required=restart,
             )
         must_pause_runner = True
     elif terminal_stop:
@@ -595,7 +804,6 @@ def run_case(
         (cp / "run_restart_required.done").write_text(
             f"Restart required at {end}; simulation_time_s={final_sim}.\n", encoding="utf-8"
         )
-        # Do not proceed to later cases while this logical case is incomplete.
         must_pause_runner = True
     elif exit_code == 0 and reason == "final_simulation_time":
         status.update(
@@ -639,12 +847,8 @@ def run_case(
     if campaign_pause_after_current:
         if pause_request is not None:
             update_control(
-                root,
-                pause_request,
-                "handled",
-                active_case_id=cid,
-                outcome="current_case_completed_runner_paused",
-                case_status=status["status"],
+                root, pause_request, "handled", active_case_id=cid,
+                outcome="current_case_completed_runner_paused", case_status=status["status"],
             )
         must_pause_runner = True
     return str(status["status"]), must_pause_runner
@@ -715,9 +919,9 @@ def run_bundle(root: Path, config_path: Path) -> int:
         return 3
     rows = load_cases(root)
     manifest = read_json(root / "bundle_manifest.json")
+    config["_termination_runtime"] = resolve_termination(root, config, manifest)
     with BundleLock(root):
         recover_stale_running(rows, root)
-        # Clear handled/rejected control from previous execution segment.
         ctl = control_file(root)
         if ctl.is_file():
             try:
@@ -727,6 +931,7 @@ def run_bundle(root: Path, config_path: Path) -> int:
             if str(old.get("state", "")).lower() != "requested":
                 ctl.unlink(missing_ok=True)
 
+        term = config.get("_termination_runtime")
         job = {
             "schema_version": EXECUTOR_SCHEMA_VERSION,
             "state": "running",
@@ -736,6 +941,12 @@ def run_bundle(root: Path, config_path: Path) -> int:
             "computing_module": str(config["computing_module"]),
             "computing_module_sha256": sha256_file(config["computing_module"]),
             "threads": config["threads"],
+            "termination_profile": term.get("profile_name") if term else None,
+            "termination_profile_sha256": term.get("profile_sha256") if term else None,
+            "termination_profile_parameters": term.get("profile_parameters") if term else None,
+            "termination_profile_registry_sha256": term.get("profile_registry_sha256") if term else None,
+            "quasistationary_core_sha256": term.get("quasistationary_core_sha256") if term else None,
+            "termination_override_applied": term.get("override_applied") if term else None,
         }
         write_json(root / "executor_job.json", job)
         stop_runner = False
@@ -780,11 +991,7 @@ def run_bundle(root: Path, config_path: Path) -> int:
                 job_state = "paused"
         else:
             job_state = "completed"
-        job.update(
-            state=job_state,
-            active_case_id=None,
-            finished_at_utc=utc_now(),
-        )
+        job.update(state=job_state, active_case_id=None, finished_at_utc=utc_now())
         write_json(root / "executor_job.json", job)
     return 0
 
@@ -892,6 +1099,10 @@ def pack_results(root: Path, output: Path) -> Path:
             "nrg_restart_required": st.get("nrg_restart_required"),
             "nrg_final_simulation_time_s": st.get("nrg_final_simulation_time_s"),
             "computing_module_sha256": st.get("computing_module_sha256"),
+            "physical_condition_met": st.get("physical_condition_met"),
+            "termination_profile": st.get("termination_profile"),
+            "termination_profile_sha256": st.get("termination_profile_sha256"),
+            "termination_override_applied": st.get("termination_override_applied"),
         }
     job = read_json(root / "executor_job.json") if (root / "executor_job.json").is_file() else {}
     results_manifest = {

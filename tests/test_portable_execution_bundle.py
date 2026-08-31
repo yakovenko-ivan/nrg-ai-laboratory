@@ -24,12 +24,31 @@ class PortableExecutionBundleTests(unittest.TestCase):
             Path(pb.__file__).with_name("portable_executor.py"),
             lab.research_root / "campaign_tools" / "portable_executor.py",
         )
+
+        # Portable physical termination is trusted bundle infrastructure.
+        # Mirror the two additional Laboratory resources required by
+        # portable_bundle.export_plan()/export_bundle().
+        source_root = Path(pb.__file__).resolve().parents[1]
+        (lab.research_root / "nrg_analysis").mkdir(parents=True)
+        shutil.copy2(
+            source_root / "nrg_analysis" / "quasistationary_core.py",
+            lab.research_root / "nrg_analysis" / "quasistationary_core.py",
+        )
+        lab.termination_profiles = (
+            lab.research_root / "config" / "termination_profiles.json"
+        )
+        lab.termination_profiles.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            source_root / "config" / "termination_profiles.json",
+            lab.termination_profiles,
+        )
+
         lab.campaign_root = lab.research_root / "campaigns"
         lab.campaign_root.mkdir()
         lab.runs_root = lab.research_root / "runs"
         lab.runs_root.mkdir()
         lab.config_path = lab.research_root / "config" / "laboratory.toml"
-        lab.config_path.parent.mkdir()
+        lab.config_path.parent.mkdir(parents=True, exist_ok=True)
         lab.config_path.write_text("# fake\n", encoding="utf-8")
         lab.local_config_path = None
         lab.computing_module = lab.research_root / "bin" / "computing_module"

@@ -175,6 +175,8 @@ def immutable_files_for_checksum(bundle_root: Path, portable_rows: list[dict[str
         bundle_root / "cases.csv",
         bundle_root / "campaign.toml",
         bundle_root / "portable_executor.py",
+        bundle_root / "quasistationary_core.py",
+        bundle_root / "termination_profiles.json",
         bundle_root / "README_RUN.md",
         bundle_root / "EXPORT_SNAPSHOT_CHECKSUMS.sha256",
     ]
@@ -199,13 +201,12 @@ def write_static_checksums(bundle_root: Path, portable_rows: list[dict[str, str]
 def execution_config_template(source_sha: str | None) -> str:
     source_comment = source_sha or "not-recorded"
     return f'''# Machine-local configuration for this exported NRG execution bundle.
-# Edit ONLY this file on the compute host. It is execution provenance, not a
-# scientific campaign definition.
+# Runtime linkage and termination policy may be adjusted on the compute host.
+# Every selected termination registry/profile is hashed into execution provenance.
 
 [runtime]
 computing_module = "CHANGE_ME"
 # Source-machine binary SHA-256 recorded in bundle: {source_comment}
-# Set true only when the exact same binary is intentionally required.
 require_exact_binary = false
 
 [execution]
@@ -216,67 +217,186 @@ graceful_pause_timeout_seconds = 120.0
 rerun_failed = true
 continue_on_failure = false
 limit_library_threads = true
+
+[termination]
+# Leave profile_name empty to disable physical-condition monitoring.
+profile_name = "0d_cv_post_ignition_quasistationary_v2"
+# The bundled registry is the reviewed default. For a deliberate remote override,
+# copy/edit another registry file and point this field to it; the exact file and
+# selected profile are fingerprinted in executor_job.json and run_status.json.
+profile_registry = "termination_profiles.json"
 '''
 
 
 def run_readme() -> str:
     return '''# Portable NRG execution bundle
 
-This directory is a prepared scientific campaign plus a standalone execution
-client.  No AI agent and no NRG package-interface executable are required on the
-compute host.
+This directory is a prepared scientific campaign plus a standalone Python 3.11+
+execution client. No AI agent and no NRG package-interface executable are
+required on the compute host.
 
-## 1. Configure the compute host
+## Configure
 
-Edit `execution.local.toml` and set the absolute path to a compatible NRG
-`computing_module` binary and the desired thread count.
+Edit `execution.local.toml`. Set the local `computing_module` path, thread count,
+and (if desired) the physical termination profile. The bundle contains the
+reviewed termination registry and canonical quasistationarity evaluator.
 
-## 2. Validate before first execution
+The default is:
+
+    [termination]
+    profile_name = "0d_cv_post_ignition_quasistationary_v2"
+    profile_registry = "termination_profiles.json"
+
+A deliberate external-machine termination-policy change is supported: create a
+separate registry file, select it in `execution.local.toml`, and validate again.
+The selected registry SHA-256, profile SHA-256, and evaluator SHA-256 are recorded
+in execution provenance. Do not edit `quasistationary_core.py`; its bundle hash
+is verified before it is imported.
+
+## Validate
 
     python portable_executor.py validate --config execution.local.toml
 
-A differing computing-module SHA-256 is reported as provenance. Set
-`require_exact_binary = true` if the exact source binary is mandatory.
-
-## 3. Run / resume
+## Run / resume
 
     python portable_executor.py run --config execution.local.toml
 
-The same command is used after a clean pause or wall-time restart. Completed
-cases are skipped; a paused/restart-required case is continued in place.
+The same command resumes a clean wall-time restart or pause. A quasistationary
+condition writes `run_control.stop`; `condition_met` is accepted only if NRG then
+exits through the expected graceful `external_stop_request` contract.
 
-## 4. Status
+## Status and control
 
     python portable_executor.py status
-
-## 5. Pause
-
-Immediate restartable pause (NRG writes a checkpoint):
-
     python portable_executor.py pause --mode now
-
-Pause after the current case finishes naturally:
-
     python portable_executor.py pause --mode after-current
+    python portable_executor.py stop
 
-Do not kill `computing_module` manually when a pause is available.
-
-## 6. Return results
-
-After the executor is not running:
+## Return results
 
     python portable_executor.py pack-results --output results.zip
 
-Copy `results.zip` back to the agentic/scientific environment and import it with
-the trusted NRG Laboratory result-import tool.
-
-## Portability boundary
-
-Campaign/result transfer is portable. Restart checkpoints are raw NRG binary
-state and should only be moved between binary-compatible NRG runtimes (same data
-kinds/endianness/restart schema; preferably the same source revision/build).
+Restart checkpoints are raw NRG binary state and should only be moved between
+binary-compatible NRG runtimes.
 '''
 
+
+def _portable_termination_sources(lab: Laboratory) -> tuple[Path, Path]:
+    core = (lab.research_root / "nrg_analysis" / "quasistationary_core.py").resolve()
+    registry = lab.termination_profiles.resolve()
+    return core, registry
+
+
+def _validate_default_profile(registry: Path) -> None:
+    data = read_json(registry)
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict) or DEFAULT_TERMINATION_PROFILE not in profiles:
+        raise ValueError(
+            f"default portable termination profile {DEFAULT_TERMINATION_PROFILE!r} "
+            f"not found in {registry}"
+        )
+
+
+def _source_resource_contract(cases: Path) -> dict[str, Any] | None:
+    manifest = cases.parent / "campaign_manifest.json"
+    if not manifest.is_file():
+        return None
+    payload = read_json(manifest)
+    contract = payload.get("task_setup_resources")
+    return contract if isinstance(contract, dict) else None
+
+
+def _verify_prepared_resource_contract(case_path: Path, contract: dict[str, Any] | None) -> list[str]:
+    if not contract:
+        return []
+    problems: list[str] = []
+    task_setup = case_path / "task_setup"
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for group in ("kinetic_mechanisms", "thermophysical_data"):
+        table = contract.get(group, {})
+        if isinstance(table, dict):
+            for key, value in table.items():
+                if isinstance(value, dict):
+                    entries.append((f"{group}.{key}", value))
+    for label, item in entries:
+        rel = str(item.get("relative_path") or "").strip()
+        expected = str(item.get("sha256") or "").strip()
+        if not rel or not expected:
+            problems.append(f"{label}: incomplete resource provenance entry")
+            continue
+        target = task_setup / Path(*PurePosixPath(rel.replace("\\", "/")).parts)
+        if not target.is_file():
+            problems.append(f"{label}: prepared resource missing: {rel}")
+            continue
+        observed = sha256_file(target)
+        if observed != expected:
+            problems.append(f"{label}: prepared resource checksum mismatch: {rel}")
+    return problems
+
+
+DEFAULT_TERMINATION_PROFILE = "0d_cv_post_ignition_quasistationary_v2"
+
+
+def _portable_termination_sources(lab: Laboratory) -> tuple[Path, Path]:
+    core = (lab.research_root / "nrg_analysis" / "quasistationary_core.py").resolve()
+    registry = lab.termination_profiles.resolve()
+    return core, registry
+
+
+def _validate_default_profile(registry: Path) -> None:
+    data = read_json(registry)
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict) or DEFAULT_TERMINATION_PROFILE not in profiles:
+        raise ValueError(
+            f"default portable termination profile {DEFAULT_TERMINATION_PROFILE!r} "
+            f"not found in {registry}"
+        )
+
+
+def _source_resource_contract(cases: Path) -> dict[str, Any] | None:
+    manifest = cases.parent / "campaign_manifest.json"
+    if not manifest.is_file():
+        return None
+    payload = read_json(manifest)
+    contract = payload.get("task_setup_resources")
+    return contract if isinstance(contract, dict) else None
+
+
+def _verify_prepared_resource_contract(case_path: Path, contract: dict[str, Any] | None) -> list[str]:
+    if not contract:
+        return []
+    problems: list[str] = []
+    task_setup = case_path / "task_setup"
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for group in ("kinetic_mechanisms", "thermophysical_data"):
+        table = contract.get(group, {})
+        if isinstance(table, dict):
+            for key, value in table.items():
+                if isinstance(value, dict):
+                    entries.append((f"{group}.{key}", value))
+    for label, item in entries:
+        rel = str(item.get("relative_path") or "").strip()
+        expected = str(item.get("sha256") or "").strip()
+        if not rel or not expected:
+            problems.append(f"{label}: incomplete resource provenance entry")
+            continue
+        target = task_setup / Path(*PurePosixPath(rel.replace("\\", "/")).parts)
+        if not target.is_file():
+            problems.append(f"{label}: prepared resource missing: {rel}")
+            continue
+        observed = sha256_file(target)
+        if observed != expected:
+            problems.append(f"{label}: prepared resource checksum mismatch: {rel}")
+    return problems
+
+
+
+def _has_initial_data_output(case_path: Path) -> bool:
+    """Return True when data_output contains at least one file at any depth."""
+    data_output = case_path / "data_output"
+    return data_output.is_dir() and any(
+        path.is_file() for path in data_output.rglob("*")
+    )
 
 def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dict[str, Any]:
     cases = cases.expanduser().resolve()
@@ -284,20 +404,40 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
     contract = campaign_contract_payload(cases, rows)
     contract_sha = canonical_sha256(contract)
     executor_source = (lab.research_root / "campaign_tools" / "portable_executor.py").resolve()
+    core_source, profile_registry = _portable_termination_sources(lab)
     problems: list[dict[str, Any]] = []
+
     if not executor_source.is_file():
         problems.append({"reason": "portable_executor_not_installed", "path": str(executor_source)})
         executor_sha = "missing"
     else:
         executor_sha = sha256_file(executor_source)
+    if not core_source.is_file():
+        problems.append({"reason": "quasistationary_core_not_installed", "path": str(core_source)})
+        core_sha = "missing"
+    else:
+        core_sha = sha256_file(core_source)
+    if not profile_registry.is_file():
+        problems.append({"reason": "termination_profiles_missing", "path": str(profile_registry)})
+        registry_sha = "missing"
+    else:
+        registry_sha = sha256_file(profile_registry)
+        try:
+            _validate_default_profile(profile_registry)
+        except Exception as exc:
+            problems.append({"reason": "default_termination_profile_invalid", "error": str(exc)})
+
     bundle_id = hashlib.sha256(
-        f"nrg-bundle-v1:{contract_sha}:{executor_sha}".encode("utf-8")
+        f"nrg-bundle-v1:{contract_sha}:{executor_sha}:{core_sha}:{registry_sha}:"
+        f"{DEFAULT_TERMINATION_PROFILE}".encode("utf-8")
     ).hexdigest()[:20]
     if output is None:
         output = lab.campaign_root / "exports" / f"{cases.parent.name}__{bundle_id}"
     output = output.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         problems.append({"reason": "output_exists_nonempty", "path": str(output)})
+
+    resource_contract = _source_resource_contract(cases)
     total_bytes = 0
     prepared = 0
     sample: list[dict[str, Any]] = []
@@ -314,11 +454,14 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
             and (src / "task_setup").is_dir()
             and (src / "setup_input.nml").is_file()
             and (src / "data_output").is_dir()
-            and any(path.is_file() for path in (src / "data_output").iterdir())
+            and _has_initial_data_output(src)
         )
         if not ready:
             problems.append({"case_id": cid, "reason": "case_not_prepared", "path": str(src)})
         else:
+            resource_problems = _verify_prepared_resource_contract(src, resource_contract)
+            for problem in resource_problems:
+                problems.append({"case_id": cid, "reason": "scientific_resource_integrity", "error": problem})
             status_path = src / "run_status.json"
             if status_path.is_file():
                 try:
@@ -326,14 +469,10 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
                 except Exception:
                     current_state = "invalid_status"
                 if current_state in {"running", "pause_failed", "invalid_status"}:
-                    problems.append(
-                        {
-                            "case_id": cid,
-                            "reason": "case_not_safely_exportable",
-                            "status": current_state,
-                            "path": str(src),
-                        }
-                    )
+                    problems.append({
+                        "case_id": cid, "reason": "case_not_safely_exportable",
+                        "status": current_state, "path": str(src),
+                    })
             prepared += 1
             for path in src.rglob("*"):
                 if path.is_file():
@@ -343,6 +482,7 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
                         pass
         if len(sample) < 8:
             sample.append({"case_id": cid, "case_relpath": rel, "source_path": str(src), "prepared": ready})
+
     return {
         "can_export": len(problems) == 0,
         "cases_csv": str(cases),
@@ -352,12 +492,19 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
         "case_count": len(rows),
         "prepared_case_count": prepared,
         "estimated_case_bytes": total_bytes,
+        "termination": {
+            "default_profile": DEFAULT_TERMINATION_PROFILE,
+            "profile_registry_sha256": None if registry_sha == "missing" else registry_sha,
+            "quasistationary_core_sha256": None if core_sha == "missing" else core_sha,
+        },
+        "scientific_resource_contract_present": resource_contract is not None,
         "problems": problems[:50],
         "problem_count": len(problems),
         "sample": sample,
         "semantics": (
-            "Export copies prepared cases into a self-contained execution bundle and rewrites only "
-            "execution locators to portable relative paths. Source campaign/results remain untouched."
+            "Export copies prepared cases into a self-contained execution bundle, verifies "
+            "available scientific-resource provenance, and rewrites only execution locators "
+            "to portable relative paths."
         ),
     }
 
@@ -375,13 +522,14 @@ def export_bundle(
     contract = campaign_contract_payload(cases, rows)
     contract_sha = canonical_sha256(contract)
     executor_source = (lab.research_root / "campaign_tools" / "portable_executor.py").resolve()
-    if not executor_source.is_file():
-        raise FileNotFoundError(
-            f"portable executor not installed in laboratory: {executor_source}"
-        )
+    core_source, profile_registry = _portable_termination_sources(lab)
     executor_sha = sha256_file(executor_source)
+    core_sha = sha256_file(core_source)
+    registry_sha = sha256_file(profile_registry)
+    _validate_default_profile(profile_registry)
     bundle_id = hashlib.sha256(
-        f"nrg-bundle-v1:{contract_sha}:{executor_sha}".encode("utf-8")
+        f"nrg-bundle-v1:{contract_sha}:{executor_sha}:{core_sha}:{registry_sha}:"
+        f"{DEFAULT_TERMINATION_PROFILE}".encode("utf-8")
     ).hexdigest()[:20]
     if output is None:
         output = lab.campaign_root / "exports" / f"{cases.parent.name}__{bundle_id}"
@@ -392,6 +540,7 @@ def export_bundle(
     (output / "runs").mkdir(exist_ok=True)
     (output / "provenance").mkdir(exist_ok=True)
 
+    resource_contract = _source_resource_contract(cases)
     portable_rows: list[dict[str, str]] = []
     case_manifest: dict[str, Any] = {}
     for row in rows:
@@ -404,12 +553,15 @@ def export_bundle(
             not (src / "task_setup").is_dir()
             or not (src / "setup_input.nml").is_file()
             or not (src / "data_output").is_dir()
-            or not any(path.is_file() for path in (src / "data_output").iterdir())
+            or not _has_initial_data_output(src)
         ):
             raise ValueError(
                 f"case {cid} is not execution-ready: prepared task_setup, setup_input.nml "
                 "and initial data_output state are required"
             )
+        integrity = _verify_prepared_resource_contract(src, resource_contract)
+        if integrity:
+            raise ValueError(f"case {cid} scientific-resource integrity failed: {'; '.join(integrity)}")
         dst = output / "runs" / Path(*PurePosixPath(rel).parts)
         if dst.exists():
             raise ValueError(f"duplicate portable case path: {rel}")
@@ -445,12 +597,11 @@ def export_bundle(
         shutil.copy2(source_manifest, output / "provenance" / "source_campaign_manifest.json")
     source_runtime_manifest = lab.runtime_manifest
     if source_runtime_manifest.is_file():
-        shutil.copy2(
-            source_runtime_manifest,
-            output / "provenance" / "source_runtime_manifest.json",
-        )
+        shutil.copy2(source_runtime_manifest, output / "provenance" / "source_runtime_manifest.json")
     shutil.copy2(cases, output / "provenance" / "source_cases.csv")
     shutil.copy2(executor_source, output / "portable_executor.py")
+    shutil.copy2(core_source, output / "quasistationary_core.py")
+    shutil.copy2(profile_registry, output / "termination_profiles.json")
     (output / "README_RUN.md").write_text(run_readme(), encoding="utf-8")
 
     source_runtime = {
@@ -460,14 +611,11 @@ def export_bundle(
         "runtime_manifest_sha256": (
             sha256_file(source_runtime_manifest) if source_runtime_manifest.is_file() else None
         ),
-        # Absolute source paths are provenance only, never execution locators.
         "generation_environment": {
             "computing_module": str(lab.computing_module),
             "runs_root": str(lab.runs_root),
             "laboratory_config": str(lab.config_path),
-            "laboratory_local_config": (
-                str(lab.local_config_path) if lab.local_config_path else None
-            ),
+            "laboratory_local_config": str(lab.local_config_path) if lab.local_config_path else None,
         },
     }
     bundle_manifest = {
@@ -482,13 +630,21 @@ def export_bundle(
             "absolute_source_paths_authoritative": False,
         },
         "executor_sha256": executor_sha,
+        "termination": {
+            "default_profile": DEFAULT_TERMINATION_PROFILE,
+            "profile_registry_file": "termination_profiles.json",
+            "profile_registry_sha256": registry_sha,
+            "quasistationary_core_file": "quasistationary_core.py",
+            "quasistationary_core_sha256": core_sha,
+            "remote_profile_override_supported": True,
+        },
+        "scientific_resources": resource_contract,
         "source_runtime": source_runtime,
         "cases": case_manifest,
     }
     write_json(output / "bundle_manifest.json", bundle_manifest)
     (output / "execution.local.toml").write_text(
-        execution_config_template(source_runtime["computing_module_sha256"]),
-        encoding="utf-8",
+        execution_config_template(source_runtime["computing_module_sha256"]), encoding="utf-8"
     )
     write_export_snapshot_checksums(output)
     write_static_checksums(output, portable_rows)
@@ -498,6 +654,9 @@ def export_bundle(
         "campaign_contract_sha256": contract_sha,
         "case_count": len(rows),
         "portable_executor": str(output / "portable_executor.py"),
+        "quasistationary_core": str(output / "quasistationary_core.py"),
+        "termination_profiles": str(output / "termination_profiles.json"),
+        "default_termination_profile": DEFAULT_TERMINATION_PROFILE,
         "local_execution_config": str(output / "execution.local.toml"),
     }
 
