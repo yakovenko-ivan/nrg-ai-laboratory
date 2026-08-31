@@ -429,7 +429,7 @@ export default function (pi: ExtensionAPI) {
       cases: Type.String({ description: "Path to generated cases.csv" }),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const status = await bridge(["campaign-status", "--cases", params.cases], signal);
+      const status = await bridge(["campaign-status", "--cases", params.cases, "--full"], signal);
       if (status.error) return toolResult(status);
       if ((status.missing_cases ?? 0) === 0) return toolResult({ message: "all case directories already exist", status });
       if (!ctx.hasUI) return toolResult({ error: "case preparation requires interactive confirmation", status });
@@ -493,7 +493,7 @@ export default function (pi: ExtensionAPI) {
       cases: Type.String({ description: "Path to cases.csv" }),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const status = await bridge(["campaign-status", "--cases", params.cases], signal);
+      const status = await bridge(["campaign-status", "--cases", params.cases, "--full"], signal);
       if (status.error) return toolResult(status);
       if ((status.missing_cases ?? 0) > 0) {
         return toolResult({ error: "case directories are missing; prepare the campaign before running", status });
