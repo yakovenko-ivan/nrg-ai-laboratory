@@ -58,6 +58,10 @@ from agent_workspace.dev_transactions import (
     read_file as dev_read_file,
     apply_patch_plan as dev_apply_patch_plan,
     apply_patch_execute as dev_apply_patch_execute,
+    write_plan as dev_write_plan,
+    write_execute as dev_write_execute,
+    edit_plan as dev_edit_plan,
+    edit_execute as dev_edit_execute,
     diff as dev_diff,
     test_plan as dev_test_plan,
     test_execute as dev_test_execute,
@@ -2851,6 +2855,35 @@ def cmd_dev_apply_patch_execute(args: argparse.Namespace, lab: Laboratory) -> in
                                         args.expected_candidate_tree_sha))
 
 
+def cmd_dev_write_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_write_plan(lab, args.transaction_id, args.path, args.content, args.mode))
+
+
+def cmd_dev_write_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_write_execute(
+        lab, args.transaction_id, args.path, args.content, args.mode,
+        args.expected_semantic_spec_sha256, args.expected_head_sha,
+        args.expected_candidate_tree_sha, args.expected_branch,
+        args.expected_target_sha256,
+    ))
+
+
+def cmd_dev_edit_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_edit_plan(
+        lab, args.transaction_id, args.path, args.old_text, args.new_text,
+        args.expected_occurrences,
+    ))
+
+
+def cmd_dev_edit_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_edit_execute(
+        lab, args.transaction_id, args.path, args.old_text, args.new_text,
+        args.expected_occurrences, args.expected_semantic_spec_sha256,
+        args.expected_head_sha, args.expected_candidate_tree_sha,
+        args.expected_branch, args.expected_target_sha256,
+    ))
+
+
 def cmd_dev_diff(args: argparse.Namespace, lab: Laboratory) -> int:
     return emit(dev_diff(lab, args.transaction_id))
 
@@ -3100,6 +3133,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--expected-head-sha", default=None)
     s.add_argument("--expected-candidate-tree-sha", default=None)
 
+    s = sub.add_parser("dev-write-plan")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--path", required=True)
+    s.add_argument("--mode", required=True)
+    s.add_argument("--content", required=True)
+
+    s = sub.add_parser("dev-write-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--path", required=True)
+    s.add_argument("--mode", required=True)
+    s.add_argument("--content", required=True)
+    s.add_argument("--expected-semantic-spec-sha256", required=True)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+    s.add_argument("--expected-branch", default=None)
+    s.add_argument("--expected-target-sha256", default=None)
+
+    s = sub.add_parser("dev-edit-plan")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--path", required=True)
+    s.add_argument("--old-text", required=True)
+    s.add_argument("--new-text", required=True)
+    s.add_argument("--expected-occurrences", type=int, required=True)
+
+    s = sub.add_parser("dev-edit-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--path", required=True)
+    s.add_argument("--old-text", required=True)
+    s.add_argument("--new-text", required=True)
+    s.add_argument("--expected-occurrences", type=int, required=True)
+    s.add_argument("--expected-semantic-spec-sha256", required=True)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+    s.add_argument("--expected-branch", default=None)
+    s.add_argument("--expected-target-sha256", default=None)
+
     s = sub.add_parser("dev-diff")
     s.add_argument("--transaction-id", required=True)
 
@@ -3196,6 +3265,10 @@ def main() -> int:
             "dev-read": cmd_dev_read,
             "dev-apply-patch-plan": cmd_dev_apply_patch_plan,
             "dev-apply-patch-execute": cmd_dev_apply_patch_execute,
+            "dev-write-plan": cmd_dev_write_plan,
+            "dev-write-execute": cmd_dev_write_execute,
+            "dev-edit-plan": cmd_dev_edit_plan,
+            "dev-edit-execute": cmd_dev_edit_execute,
             "dev-diff": cmd_dev_diff,
             "dev-test-plan": cmd_dev_test_plan,
             "dev-test-execute": cmd_dev_test_execute,

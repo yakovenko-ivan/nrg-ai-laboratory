@@ -44,6 +44,7 @@ Design invariants (carried from v3)
 * Transaction records are invariant-checked on every load against trusted
   derivation.
 * Patch artifacts must resolve under the configured studies workspace.
+* Semantic write/edit operations accept plain UTF-8 text intent and have the trusted engine generate and persist the canonical Git patch artifact.
 * Plan/read-only operations are side-effect-free.
 * No push/merge/rebase/tag/runtime promotion. Test execution is NOT an OS
   sandbox; candidate Python runs with the local user's permissions.
@@ -53,6 +54,7 @@ Python 3.11+; standard library only.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -794,6 +796,335 @@ def apply_patch_execute(lab, tid: str, patch_path: str, expected_patch_sha256: s
         "applied_against_tree_sha": tree_before,
         "resulting_tree_sha": tree_after,
     }
+
+
+# ---------------------------------------------------------------------------
+# semantic text edits (trusted engine authors the canonical Git patch)
+# ---------------------------------------------------------------------------
+
+def _semantic_spec_sha(payload: dict) -> str:
+    text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return _sha256_text(text)
+
+
+def _semantic_preview(rel: str, before: str, after: str, limit: int = 8192) -> str:
+    lines = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{rel}",
+        tofile=f"b/{rel}",
+    )
+    text = "".join(lines)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... <truncated {len(text) - limit} chars>\n"
+
+
+def _semantic_context(lab, tid: str, relpath: str) -> tuple[dict, dict, Path, str, Path]:
+    policy = _load_policy(lab)
+    rec = _load_transaction(lab, policy, tid)
+    if rec.get("final_state") not in (None, "active"):
+        raise DevTransactionError(f"transaction is not active: {rec.get('final_state')}")
+    wt = Path(rec["worktree"])
+    if not wt.is_dir():
+        raise DevTransactionError(f"worktree is missing for transaction {tid}")
+    norm = _normalize_repo_rel(wt, relpath)
+    _validate_touched_path(wt, norm, rec["allowed_paths"], rec["denylist"], rec["self_protected_paths"])
+    target = wt / norm
+    if target.is_symlink():
+        raise DevTransactionError(f"semantic edits refuse symlink targets: {norm}")
+    if not target.parent.is_dir():
+        raise DevTransactionError(
+            f"semantic edits require an existing parent directory: {target.parent}"
+        )
+    unexpected = _unexpected_worktree_changes(wt)
+    if unexpected:
+        raise DevTransactionError(
+            f"refuse semantic edit: pre-existing unexpected working-tree changes: {unexpected}"
+        )
+    branch = _current_branch(wt)
+    if branch != rec["development_branch"]:
+        raise DevTransactionError(
+            f"current branch {branch!r} is not the development branch {rec['development_branch']!r}"
+        )
+    return policy, rec, wt, norm, target
+
+
+def _read_text_target(target: Path, rel: str) -> tuple[bool, str, str | None]:
+    if not target.exists():
+        return False, "", None
+    if not target.is_file():
+        raise DevTransactionError(f"semantic edit target is not a regular file: {rel}")
+    try:
+        text = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise DevTransactionError(f"semantic edits support UTF-8 text files only: {rel}") from exc
+    return True, text, _sha256_text(text)
+
+
+def _semantic_size_limit(policy: dict) -> int:
+    return int(policy.get("max_semantic_text_bytes", policy.get("max_patch_bytes", 524288)))
+
+
+def _validate_semantic_text(policy: dict, text: str, label: str) -> int:
+    if "\x00" in text:
+        raise DevTransactionError(f"{label} contains NUL; semantic edits are text-only")
+    size = len(text.encode("utf-8"))
+    limit = _semantic_size_limit(policy)
+    if size > limit:
+        raise DevTransactionError(f"{label} exceeds semantic text limit {limit} bytes")
+    return size
+
+
+def write_plan(lab, tid: str, relpath: str, content: str, mode: str) -> dict:
+    policy, _rec, wt, norm, target = _semantic_context(lab, tid, relpath)
+    mode = str(mode).strip().lower()
+    if mode not in {"create", "replace"}:
+        raise DevTransactionError("semantic write mode must be 'create' or 'replace'")
+    content_bytes = _validate_semantic_text(policy, content, "content")
+    exists, before, target_sha = _read_text_target(target, norm)
+    if mode == "create" and exists:
+        raise DevTransactionError(f"create refused because target already exists: {norm}")
+    if mode == "replace" and not exists:
+        raise DevTransactionError(f"replace refused because target does not exist: {norm}")
+    head = _current_head(wt)
+    branch = _current_branch(wt)
+    tree = _write_tree(wt)
+    content_sha = _sha256_text(content)
+    spec_sha = _semantic_spec_sha({
+        "kind": "write", "path": norm, "mode": mode,
+        "content_sha256": content_sha, "content_bytes": content_bytes,
+    })
+    return {
+        "can_write": True,
+        "transaction_id": tid,
+        "path": norm,
+        "mode": mode,
+        "target_exists": exists,
+        "current_target_sha256": target_sha,
+        "resulting_target_sha256": content_sha,
+        "content_bytes": content_bytes,
+        "semantic_spec_sha256": spec_sha,
+        "current_head_sha": head,
+        "current_branch": branch,
+        "applied_against_tree_sha": tree,
+        "preview_diff": _semantic_preview(norm, before, content),
+    }
+
+
+def edit_plan(lab, tid: str, relpath: str, old_text: str, new_text: str,
+              expected_occurrences: int = 1) -> dict:
+    policy, _rec, wt, norm, target = _semantic_context(lab, tid, relpath)
+    if not old_text:
+        raise DevTransactionError("old_text must be non-empty")
+    if int(expected_occurrences) < 1:
+        raise DevTransactionError("expected_occurrences must be >= 1")
+    _validate_semantic_text(policy, old_text, "old_text")
+    _validate_semantic_text(policy, new_text, "new_text")
+    exists, before, target_sha = _read_text_target(target, norm)
+    if not exists:
+        raise DevTransactionError(f"edit target does not exist: {norm}")
+    actual = before.count(old_text)
+    can_edit = actual == int(expected_occurrences)
+    after = before.replace(old_text, new_text) if can_edit else before
+    result_bytes = _validate_semantic_text(policy, after, "resulting content")
+    head = _current_head(wt)
+    branch = _current_branch(wt)
+    tree = _write_tree(wt)
+    spec_sha = _semantic_spec_sha({
+        "kind": "edit", "path": norm,
+        "old_text_sha256": _sha256_text(old_text),
+        "new_text_sha256": _sha256_text(new_text),
+        "expected_occurrences": int(expected_occurrences),
+    })
+    return {
+        "can_edit": can_edit,
+        "transaction_id": tid,
+        "path": norm,
+        "expected_occurrences": int(expected_occurrences),
+        "actual_occurrences": actual,
+        "current_target_sha256": target_sha,
+        "resulting_target_sha256": _sha256_text(after),
+        "resulting_bytes": result_bytes,
+        "semantic_spec_sha256": spec_sha,
+        "current_head_sha": head,
+        "current_branch": branch,
+        "applied_against_tree_sha": tree,
+        "preview_diff": _semantic_preview(norm, before, after) if can_edit else "",
+        "issue": None if can_edit else (
+            f"expected {int(expected_occurrences)} exact occurrence(s), found {actual}"
+        ),
+    }
+
+
+def _semantic_patch_artifact(lab, policy: dict, tid: str, sequence: int, patch_text: str) -> tuple[str, str]:
+    base = _transactions_root_path(lab, policy) / tid / "semantic_edits"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"edit_{sequence:04d}.patch"
+    path.write_text(patch_text, encoding="utf-8")
+    return str(path), _sha256_text(patch_text)
+
+
+def _rollback_semantic_change(wt: Path, target: Path, existed: bool, old_text: str,
+                              tree_before: str) -> None:
+    if existed:
+        target.write_text(old_text, encoding="utf-8")
+    elif target.exists():
+        target.unlink()
+    reset = _run_git(["read-tree", tree_before], wt)
+    if reset.returncode != 0:
+        raise DevTransactionError(
+            f"semantic edit rollback could not restore candidate index: {reset.stderr.strip()}"
+        )
+
+
+def _apply_semantic_text(lab, tid: str, kind: str, norm: str, new_text: str,
+                         spec_sha: str, metadata: dict,
+                         expected_head_sha: str | None,
+                         expected_candidate_tree_sha: str | None,
+                         expected_branch: str | None,
+                         expected_target_sha256: str | None) -> dict:
+    policy, rec, wt, norm2, target = _semantic_context(lab, tid, norm)
+    if norm2 != norm:
+        raise DevTransactionError("normalized semantic path changed unexpectedly")
+    existed, old_text, target_sha = _read_text_target(target, norm)
+    if expected_target_sha256 != target_sha:
+        raise DevTransactionError(
+            f"target content changed after confirmation: expected {expected_target_sha256}, got {target_sha}"
+        )
+    head = _current_head(wt)
+    branch = _current_branch(wt)
+    tree_before = _write_tree(wt)
+    if expected_head_sha and head != expected_head_sha:
+        raise DevTransactionError(
+            f"head changed after confirmation: expected {expected_head_sha}, got {head}"
+        )
+    if expected_branch and branch != expected_branch:
+        raise DevTransactionError(
+            f"branch changed after confirmation: expected {expected_branch}, got {branch}"
+        )
+    if expected_candidate_tree_sha and tree_before != expected_candidate_tree_sha:
+        raise DevTransactionError(
+            f"candidate tree changed after confirmation: expected {expected_candidate_tree_sha}, got {tree_before}"
+        )
+
+    artifact_path: Path | None = None
+    try:
+        target.write_text(new_text, encoding="utf-8")
+        add = _run_git(["add", "--", norm], wt)
+        if add.returncode != 0:
+            raise DevTransactionError(f"git add failed for semantic edit: {add.stderr.strip()}")
+        staged = _staged_paths(wt)
+        for rel in staged:
+            _validate_touched_path(
+                wt, rel, rec["allowed_paths"], rec["denylist"], rec["self_protected_paths"]
+            )
+        unexpected = _unexpected_worktree_changes(wt)
+        if unexpected:
+            raise DevTransactionError(
+                f"unexpected unstaged/untracked changes after semantic edit: {unexpected}"
+            )
+        tree_after = _write_tree(wt)
+        canonical = _run_git(
+            ["diff", "--no-ext-diff", tree_before, tree_after, "--", norm], wt
+        )
+        if canonical.returncode != 0:
+            raise DevTransactionError(
+                f"could not generate canonical semantic patch: {canonical.stderr.strip()}"
+            )
+        patch_text = canonical.stdout
+        if not patch_text:
+            raise DevTransactionError("semantic edit produced no candidate-tree change")
+        artifact, patch_sha = _semantic_patch_artifact(
+            lab, policy, tid, len(rec["patches"]) + 1, patch_text
+        )
+        artifact_path = Path(artifact)
+        info = _parse_patch(patch_text)
+        entry = {
+            "kind": kind,
+            "semantic_spec_sha256": spec_sha,
+            "patch_artifact": artifact,
+            "patch_sha256": patch_sha,
+            "applied_at_utc": utc_now(),
+            "touched_paths": [norm],
+            "insertions": info["insertions"],
+            "deletions": info["deletions"],
+            "applied_against_head_sha": head,
+            "applied_against_tree_sha": tree_before,
+            "resulting_tree_sha": tree_after,
+            **metadata,
+        }
+        rec["patches"].append(entry)
+        _save_transaction(lab, policy, tid, rec)
+    except Exception:
+        try:
+            _rollback_semantic_change(wt, target, existed, old_text, tree_before)
+        finally:
+            if artifact_path is not None:
+                artifact_path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "applied": True,
+        "kind": kind,
+        "transaction_id": tid,
+        "path": norm,
+        "semantic_spec_sha256": spec_sha,
+        "canonical_patch_artifact": str(artifact_path),
+        "canonical_patch_sha256": patch_sha,
+        "staged_paths": staged,
+        "applied_against_head_sha": head,
+        "applied_against_tree_sha": tree_before,
+        "resulting_tree_sha": tree_after,
+    }
+
+
+def write_execute(lab, tid: str, relpath: str, content: str, mode: str,
+                  expected_semantic_spec_sha256: str,
+                  expected_head_sha: str | None = None,
+                  expected_candidate_tree_sha: str | None = None,
+                  expected_branch: str | None = None,
+                  expected_target_sha256: str | None = None) -> dict:
+    plan = write_plan(lab, tid, relpath, content, mode)
+    if plan["semantic_spec_sha256"] != expected_semantic_spec_sha256:
+        raise DevTransactionError(
+            "semantic write specification changed after confirmation: "
+            f"expected {expected_semantic_spec_sha256}, got {plan['semantic_spec_sha256']}"
+        )
+    return _apply_semantic_text(
+        lab, tid, "semantic_write", plan["path"], content, plan["semantic_spec_sha256"],
+        {"mode": plan["mode"], "resulting_target_sha256": plan["resulting_target_sha256"]},
+        expected_head_sha, expected_candidate_tree_sha, expected_branch,
+        expected_target_sha256,
+    )
+
+
+def edit_execute(lab, tid: str, relpath: str, old_text: str, new_text: str,
+                 expected_occurrences: int, expected_semantic_spec_sha256: str,
+                 expected_head_sha: str | None = None,
+                 expected_candidate_tree_sha: str | None = None,
+                 expected_branch: str | None = None,
+                 expected_target_sha256: str | None = None) -> dict:
+    plan = edit_plan(lab, tid, relpath, old_text, new_text, expected_occurrences)
+    if plan["semantic_spec_sha256"] != expected_semantic_spec_sha256:
+        raise DevTransactionError(
+            "semantic edit specification changed after confirmation: "
+            f"expected {expected_semantic_spec_sha256}, got {plan['semantic_spec_sha256']}"
+        )
+    if not plan["can_edit"]:
+        raise DevTransactionError(plan["issue"] or "semantic edit precondition failed")
+    _policy, _rec, _wt, norm, target = _semantic_context(lab, tid, plan["path"])
+    _exists, before, _sha = _read_text_target(target, norm)
+    after = before.replace(old_text, new_text)
+    return _apply_semantic_text(
+        lab, tid, "semantic_edit", norm, after, plan["semantic_spec_sha256"],
+        {
+            "expected_occurrences": int(expected_occurrences),
+            "resulting_target_sha256": plan["resulting_target_sha256"],
+        },
+        expected_head_sha, expected_candidate_tree_sha, expected_branch,
+        expected_target_sha256,
+    )
 
 
 def diff(lab, tid: str) -> dict:

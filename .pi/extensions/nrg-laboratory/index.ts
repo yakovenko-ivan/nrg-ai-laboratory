@@ -1123,6 +1123,99 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "nrg_dev_write",
+    label: "NRG Dev Write",
+    description: "Create or replace one allowlisted UTF-8 text file in the isolated development worktree. The trusted engine validates transaction/path/TCB policy, binds execution to semantic-spec SHA + HEAD + branch + candidate tree + target content, stages the result, and generates/persists the canonical Git patch. Requires confirmation.",
+    promptSnippet: "Create or replace an allowlisted text file in a guarded development transaction",
+    promptGuidelines: [
+      "Prefer this semantic tool over hand-authoring a unified diff for ordinary text-file creation or whole-file replacement.",
+      "Transaction metadata returned by nrg_dev_* tools is authoritative; do not rediscover HEAD/branch/worktree through shell unless a guarded tool lacks required information.",
+      "Use mode=create only for a path that does not exist and mode=replace only for an existing UTF-8 text file.",
+      "The trusted engine stages the result and generates the canonical patch artifact; the agent does not author or hash a patch file.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      path: Type.String({ description: "Repository-relative allowlisted text-file path" }),
+      mode: Type.String({ description: "Exactly create or replace" }),
+      content: Type.String({ description: "Complete UTF-8 text content" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge([
+        "dev-write-plan", "--transaction-id", params.transaction_id,
+        "--path", params.path, "--mode", params.mode, `--content=${params.content}`,
+      ], signal);
+      if (plan.error || !plan.can_write) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev semantic write requires interactive confirmation", plan });
+      const preview = (plan.preview_diff ?? "").slice(0, 2000);
+      const ok = await ctx.ui.confirm(
+        "Apply semantic write to development worktree?",
+        `${plan.mode} ${plan.path} (${plan.content_bytes} bytes). ` +
+        `Spec ${plan.semantic_spec_sha256.slice(0, 12)}, candidate tree ${plan.applied_against_tree_sha.slice(0, 12)}.` +
+        (preview ? `\n\nPreview:\n${preview}` : ""),
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const args = [
+        "dev-write-execute", "--transaction-id", params.transaction_id,
+        "--path", params.path, "--mode", params.mode, `--content=${params.content}`,
+        "--expected-semantic-spec-sha256", plan.semantic_spec_sha256,
+        "--expected-head-sha", plan.current_head_sha,
+        "--expected-candidate-tree-sha", plan.applied_against_tree_sha,
+        "--expected-branch", plan.current_branch,
+      ];
+      if (plan.current_target_sha256) args.push("--expected-target-sha256", plan.current_target_sha256);
+      return toolResult(await bridge(args, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_edit",
+    label: "NRG Dev Edit",
+    description: "Perform one exact bounded old_text→new_text replacement in an allowlisted UTF-8 text file inside the isolated development worktree. The plan verifies the exact occurrence count; execute is bound to semantic-spec SHA + HEAD + branch + candidate tree + target content. The trusted engine stages the result and generates/persists the canonical Git patch. Requires confirmation.",
+    promptSnippet: "Apply an exact text replacement in a guarded development transaction",
+    promptGuidelines: [
+      "Prefer this semantic tool over hand-authored diff hunks for bounded textual edits.",
+      "Set expected_occurrences explicitly; if the exact old_text count differs, the tool refuses rather than guessing.",
+      "Transaction metadata returned by nrg_dev_* tools is authoritative; avoid redundant shell Git inspection.",
+      "The trusted engine generates the canonical patch artifact after staging the confirmed semantic edit.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      path: Type.String({ description: "Repository-relative allowlisted existing UTF-8 text-file path" }),
+      old_text: Type.String({ description: "Exact text to replace" }),
+      new_text: Type.String({ description: "Replacement text" }),
+      expected_occurrences: Type.Number({ minimum: 1, description: "Exact number of old_text occurrences required" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge([
+        "dev-edit-plan", "--transaction-id", params.transaction_id,
+        "--path", params.path, `--old-text=${params.old_text}`, `--new-text=${params.new_text}`,
+        "--expected-occurrences", String(params.expected_occurrences),
+      ], signal);
+      if (plan.error || !plan.can_edit) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev semantic edit requires interactive confirmation", plan });
+      const preview = (plan.preview_diff ?? "").slice(0, 2000);
+      const ok = await ctx.ui.confirm(
+        "Apply semantic edit to development worktree?",
+        `Edit ${plan.path}: ${plan.actual_occurrences} confirmed occurrence(s). ` +
+        `Spec ${plan.semantic_spec_sha256.slice(0, 12)}, candidate tree ${plan.applied_against_tree_sha.slice(0, 12)}.` +
+        (preview ? `\n\nPreview:\n${preview}` : ""),
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const args = [
+        "dev-edit-execute", "--transaction-id", params.transaction_id,
+        "--path", params.path, `--old-text=${params.old_text}`, `--new-text=${params.new_text}`,
+        "--expected-occurrences", String(params.expected_occurrences),
+        "--expected-semantic-spec-sha256", plan.semantic_spec_sha256,
+        "--expected-head-sha", plan.current_head_sha,
+        "--expected-candidate-tree-sha", plan.applied_against_tree_sha,
+        "--expected-branch", plan.current_branch,
+        "--expected-target-sha256", plan.current_target_sha256,
+      ];
+      return toolResult(await bridge(args, signal));
+    },
+  });
+
+  pi.registerTool({
     name: "nrg_dev_diff",
     label: "NRG Dev Diff",
     description: "Read-only diff of the staged candidate state in the isolated development worktree: staged files, diff stat, unified diff, candidate_tree_sha, unexpected changes.",

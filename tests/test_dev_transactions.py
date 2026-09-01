@@ -1,7 +1,7 @@
 """Disposable dynamic test suite for guarded development transactions (v1, v6 installer-corrected).
 
 Tests run in temporary Git repositories created under tempfile — never against
-production data.  36 tests cover the V4 transaction corrections plus V5/V6 installer integration and cumulative multi-operation idempotency.
+production data.  46 tests cover the V4 transaction corrections plus V5/V6 installer integration and cumulative multi-operation idempotency.
 
 Run:  python -m pytest tests/test_dev_transactions.py -q
 """
@@ -675,6 +675,150 @@ class DevTransactionTests(unittest.TestCase):
                 any("cumulative bootstrap post-image" in p
                     for p in report["problems"])
             )
+
+    # 32-41. semantic write/edit interface (trusted engine authors patch artifacts)
+    def test_semantic_write_create_stages_and_audits(self):
+        res = self._start(allow=("tests/",))
+        content = "def test_semantic():\n    assert True\n"
+        plan = dev.write_plan(self.lab, res["transaction_id"], "tests/semantic_tmp.py", content, "create")
+        self.assertTrue(plan["can_write"])
+        self.assertIsNone(plan["current_target_sha256"])
+        out = dev.write_execute(
+            self.lab, res["transaction_id"], "tests/semantic_tmp.py", content, "create",
+            plan["semantic_spec_sha256"], plan["current_head_sha"],
+            plan["applied_against_tree_sha"], plan["current_branch"],
+            plan["current_target_sha256"],
+        )
+        self.assertTrue(out["applied"])
+        self.assertEqual(out["kind"], "semantic_write")
+        self.assertIn("tests/semantic_tmp.py", out["staged_paths"])
+        artifact = Path(out["canonical_patch_artifact"])
+        self.assertTrue(artifact.is_file())
+        patch = artifact.read_text(encoding="utf-8")
+        self.assertIn("tests/semantic_tmp.py", patch)
+        self.assertIn("+def test_semantic():", patch)
+
+    def test_semantic_write_replace_existing_text(self):
+        res = self._start(allow=("tests/test_noop.py",))
+        replacement = "def test_ok():\n    assert 2 == 2\n"
+        plan = dev.write_plan(self.lab, res["transaction_id"], "tests/test_noop.py", replacement, "replace")
+        out = dev.write_execute(
+            self.lab, res["transaction_id"], "tests/test_noop.py", replacement, "replace",
+            plan["semantic_spec_sha256"], plan["current_head_sha"],
+            plan["applied_against_tree_sha"], plan["current_branch"],
+            plan["current_target_sha256"],
+        )
+        wt = Path(res["worktree"])
+        self.assertEqual((wt / "tests/test_noop.py").read_text(encoding="utf-8"), replacement)
+        self.assertIn("tests/test_noop.py", out["staged_paths"])
+
+    def test_semantic_edit_exact_replacement(self):
+        res = self._start(allow=("tests/test_noop.py",))
+        plan = dev.edit_plan(
+            self.lab, res["transaction_id"], "tests/test_noop.py",
+            "assert 1 == 1", "assert 3 == 3", 1,
+        )
+        self.assertTrue(plan["can_edit"])
+        out = dev.edit_execute(
+            self.lab, res["transaction_id"], "tests/test_noop.py",
+            "assert 1 == 1", "assert 3 == 3", 1,
+            plan["semantic_spec_sha256"], plan["current_head_sha"],
+            plan["applied_against_tree_sha"], plan["current_branch"],
+            plan["current_target_sha256"],
+        )
+        self.assertEqual(out["kind"], "semantic_edit")
+        wt = Path(res["worktree"])
+        self.assertIn("assert 3 == 3", (wt / "tests/test_noop.py").read_text(encoding="utf-8"))
+
+    def test_semantic_edit_occurrence_mismatch_refuses(self):
+        res = self._start(allow=("tests/test_noop.py",))
+        plan = dev.edit_plan(
+            self.lab, res["transaction_id"], "tests/test_noop.py",
+            "assert 1 == 1", "assert True", 2,
+        )
+        self.assertFalse(plan["can_edit"])
+        self.assertEqual(plan["actual_occurrences"], 1)
+
+    def test_semantic_write_enforces_allowlist_and_self_protection(self):
+        res = self._start(allow=("tests/", "agent_workspace/dev_transactions.py"))
+        with self.assertRaises(dev.DevTransactionError):
+            dev.write_plan(self.lab, res["transaction_id"], "README.md", "x\n", "replace")
+        with self.assertRaises(dev.DevTransactionError):
+            dev.write_plan(
+                self.lab, res["transaction_id"],
+                "agent_workspace/dev_transactions.py", "x\n", "create",
+            )
+
+    def test_semantic_write_spec_change_after_confirmation_rejected(self):
+        res = self._start(allow=("tests/",))
+        plan = dev.write_plan(self.lab, res["transaction_id"], "tests/x.py", "a\n", "create")
+        with self.assertRaises(dev.DevTransactionError):
+            dev.write_execute(
+                self.lab, res["transaction_id"], "tests/x.py", "b\n", "create",
+                plan["semantic_spec_sha256"], plan["current_head_sha"],
+                plan["applied_against_tree_sha"], plan["current_branch"],
+                plan["current_target_sha256"],
+            )
+
+    def test_semantic_write_stale_candidate_tree_rejected(self):
+        res = self._start(allow=("tests/",))
+        plan = dev.write_plan(self.lab, res["transaction_id"], "tests/x.py", "x\n", "create")
+        self._apply(res, "tests/y.py", "y\n")
+        with self.assertRaises(dev.DevTransactionError):
+            dev.write_execute(
+                self.lab, res["transaction_id"], "tests/x.py", "x\n", "create",
+                plan["semantic_spec_sha256"], plan["current_head_sha"],
+                plan["applied_against_tree_sha"], plan["current_branch"],
+                plan["current_target_sha256"],
+            )
+
+    def test_semantic_write_unexpected_worktree_change_blocks_plan(self):
+        res = self._start(allow=("tests/",))
+        wt = Path(res["worktree"])
+        (wt / "tests/test_noop.py").write_text("def test_ok():\n    assert False\n", encoding="utf-8")
+        with self.assertRaises(dev.DevTransactionError):
+            dev.write_plan(self.lab, res["transaction_id"], "tests/x.py", "x\n", "create")
+
+    def test_semantic_write_rolls_back_if_record_persist_fails(self):
+        res = self._start(allow=("tests/",))
+        plan = dev.write_plan(self.lab, res["transaction_id"], "tests/rollback.py", "x = 1\n", "create")
+        original = dev._save_transaction
+
+        def fail_save(*_args, **_kwargs):
+            raise RuntimeError("simulated record failure")
+
+        dev._save_transaction = fail_save
+        try:
+            with self.assertRaises(RuntimeError):
+                dev.write_execute(
+                    self.lab, res["transaction_id"], "tests/rollback.py", "x = 1\n", "create",
+                    plan["semantic_spec_sha256"], plan["current_head_sha"],
+                    plan["applied_against_tree_sha"], plan["current_branch"],
+                    plan["current_target_sha256"],
+                )
+        finally:
+            dev._save_transaction = original
+        wt = Path(res["worktree"])
+        self.assertFalse((wt / "tests/rollback.py").exists())
+        self.assertEqual(dev._write_tree(wt), plan["applied_against_tree_sha"])
+        self.assertEqual(dev._unexpected_worktree_changes(wt), [])
+
+    def test_semantic_edit_canonical_patch_is_operation_delta(self):
+        res = self._start(allow=("tests/test_noop.py",))
+        plan = dev.edit_plan(
+            self.lab, res["transaction_id"], "tests/test_noop.py",
+            "assert 1 == 1", "assert 9 == 9", 1,
+        )
+        out = dev.edit_execute(
+            self.lab, res["transaction_id"], "tests/test_noop.py",
+            "assert 1 == 1", "assert 9 == 9", 1,
+            plan["semantic_spec_sha256"], plan["current_head_sha"],
+            plan["applied_against_tree_sha"], plan["current_branch"],
+            plan["current_target_sha256"],
+        )
+        patch = Path(out["canonical_patch_artifact"]).read_text(encoding="utf-8")
+        self.assertIn("-    assert 1 == 1", patch)
+        self.assertIn("+    assert 9 == 9", patch)
 
     # --- helper for installer tests ---
     def _load_installer(self):
