@@ -12,6 +12,16 @@ Do not modify `nrg_analysis/`, `campaign_tools/campaign_generator_0d.py`, `campa
 
 Use registered `nrg_*` tools for laboratory state changes, scientific execution, campaign control, and other operations for which a trusted laboratory tool exists. A restricted read-only Pi `bash` channel is available only for inspection as described below. User-entered `!` shell commands are separate and remain under user control.
 
+
+## Guarded development transactions
+
+A separate **development transaction** capability (`nrg_dev_*` tools) exists for explicitly approved infrastructure work on this repository only. It does **not** broaden ordinary `agent_write_roots`: trusted infrastructure remains read-only for ordinary research, and the `write`/`edit` path to `campaign_tools/`, `nrg_analysis/`, `.pi/extensions/`, and trusted `config/` stays blocked.
+
+A development transaction creates an isolated Git worktree under `.local/dev_worktrees/<transaction_id>/` on an `agent-dev/<transaction_id>` branch, enforces an explicit per-transaction allowed-path set plus a hard denylist (`runs/`, `campaigns/`, `.git/`, `.venv/`, `.local/`, `agent_workspace/studies/`, `agent_workspace/portable_returns/`, `config/laboratory.local.toml`) plus a self-protected development-TCB list, and applies only reviewed patch artifacts through `plan -> confirm -> execute -> verify`. Every plan->execute transition is bound to the confirmed plan (expected patch SHA / head / candidate tree / branch). The authoritative candidate state is the worktree Git index (`candidate_tree_sha = git write-tree`), not HEAD alone. Test execution refuses if the working tree does not match the candidate index; a candidate mutation during a test yields `integrity_failed`. Only named trusted test profiles run; no arbitrary shell/CLI strings. Test execution is not an OS sandbox; candidate Python runs with the local user's permissions.
+
+v1 stops at a committed development branch. The agent must **not** merge into `main`, push, create tags, or promote a runtime. Human review and promotion remain out-of-band. The development transaction's own trusted computing base (`agent_workspace/dev_transactions.py`, `config/dev_transaction_policy.json`, `agent_workspace/workspace_policy.json`, `agent_workspace/lab_bridge.py`, `.pi/extensions/nrg-laboratory/index.ts`, `.pi/extensions/nrg-laboratory/read_only_shell.ts`, `config/read_only_shell_policy.json`, `AGENTS.md`) is self-protected: ordinary `nrg_dev_*` transactions reject patches touching it. Changes to this security boundary require a separate out-of-band security bootstrap.
+
+Patch artifacts for a development transaction are authored under the configured studies workspace (`agent_workspace/studies/<dev-study>/patches/`) via ordinary `write`, then consumed by `nrg_dev_apply_patch` inside the isolated worktree. There is no direct edit-to-production path.
 ## Read-only shell inspection
 
 - A restricted Pi `bash` tool may be used for read-only filesystem, text, disk-usage, checksum, and repository inspection when the needed information is not already exposed more directly by an `nrg_*` tool or Pi's built-in read/search tools.

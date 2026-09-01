@@ -50,6 +50,23 @@ from nrg_analysis.quasistationary import (
     profile_file_sha256,
 )
 
+from agent_workspace.dev_transactions import (
+    transaction_plan as dev_transaction_plan,
+    transaction_start as dev_transaction_start,
+    transaction_status as dev_transaction_status,
+    transaction_list as dev_transaction_list,
+    read_file as dev_read_file,
+    apply_patch_plan as dev_apply_patch_plan,
+    apply_patch_execute as dev_apply_patch_execute,
+    diff as dev_diff,
+    test_plan as dev_test_plan,
+    test_execute as dev_test_execute,
+    commit_plan as dev_commit_plan,
+    commit_execute as dev_commit_execute,
+    discard_plan as dev_discard_plan,
+    discard_execute as dev_discard_execute,
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -2803,6 +2820,75 @@ def cmd_study_summary(args: argparse.Namespace, lab: Laboratory) -> int:
     return emit(payload)
 
 
+def cmd_dev_transaction_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_transaction_plan(lab, args.task, args.rationale, args.allowed_path))
+
+
+def cmd_dev_transaction_start(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_transaction_start(lab, args.transaction_id, args.task, args.rationale,
+                                      args.allowed_path, args.baseline_sha))
+
+
+def cmd_dev_transaction_status(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_transaction_status(lab, args.transaction_id))
+
+
+def cmd_dev_transaction_list(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_transaction_list(lab))
+
+
+def cmd_dev_read(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_read_file(lab, args.transaction_id, args.path, args.offset, args.limit))
+
+
+def cmd_dev_apply_patch_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_apply_patch_plan(lab, args.transaction_id, args.patch))
+
+
+def cmd_dev_apply_patch_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_apply_patch_execute(lab, args.transaction_id, args.patch,
+                                        args.expected_patch_sha256, args.expected_head_sha,
+                                        args.expected_candidate_tree_sha))
+
+
+def cmd_dev_diff(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_diff(lab, args.transaction_id))
+
+
+def cmd_dev_test_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_test_plan(lab, args.transaction_id, args.profile, args.test_file,
+                              bool(args.require_nrg)))
+
+
+def cmd_dev_test_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_test_execute(lab, args.transaction_id, args.profile, args.test_file,
+                                 bool(args.require_nrg), args.expected_candidate_tree_sha,
+                                 args.expected_head_sha, args.expected_branch))
+
+
+def cmd_dev_commit_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_commit_plan(lab, args.transaction_id, args.message))
+
+
+def cmd_dev_commit_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_commit_execute(lab, args.transaction_id, args.message,
+                                   args.expected_candidate_tree_sha,
+                                   args.expected_head_sha, args.expected_branch))
+
+
+def cmd_dev_discard_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_discard_plan(lab, args.transaction_id))
+
+
+def cmd_dev_discard_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    return emit(dev_discard_execute(lab, args.transaction_id,
+                                    args.expected_head_sha,
+                                    args.expected_candidate_tree_sha,
+                                    args.expected_branch,
+                                    args.expected_staged_path or None,
+                                    args.expected_unexpected_change or None))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--laboratory", default=None)
@@ -2980,6 +3066,80 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("study-summary")
     s.add_argument("--study", required=True)
+    s = sub.add_parser("dev-transaction-plan")
+    s.add_argument("--task", required=True)
+    s.add_argument("--rationale", required=True)
+    s.add_argument("--allowed-path", action="append", required=True)
+
+    s = sub.add_parser("dev-transaction-start")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--task", required=True)
+    s.add_argument("--rationale", required=True)
+    s.add_argument("--allowed-path", action="append", required=True)
+    s.add_argument("--baseline-sha", required=True)
+
+    s = sub.add_parser("dev-transaction-status")
+    s.add_argument("--transaction-id", required=True)
+
+    s = sub.add_parser("dev-transaction-list")
+
+    s = sub.add_parser("dev-read")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--path", required=True)
+    s.add_argument("--offset", type=int, default=1)
+    s.add_argument("--limit", type=int, default=2000)
+
+    s = sub.add_parser("dev-apply-patch-plan")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--patch", required=True)
+
+    s = sub.add_parser("dev-apply-patch-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--patch", required=True)
+    s.add_argument("--expected-patch-sha256", required=True)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+
+    s = sub.add_parser("dev-diff")
+    s.add_argument("--transaction-id", required=True)
+
+    s = sub.add_parser("dev-test-plan")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--profile", required=True)
+    s.add_argument("--test-file", action="append", default=[])
+    s.add_argument("--require-nrg", action="store_true")
+
+    s = sub.add_parser("dev-test-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--profile", required=True)
+    s.add_argument("--test-file", action="append", default=[])
+    s.add_argument("--require-nrg", action="store_true")
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-branch", default=None)
+
+    s = sub.add_parser("dev-commit-plan")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--message", required=True)
+
+    s = sub.add_parser("dev-commit-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--message", required=True)
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-branch", default=None)
+
+    s = sub.add_parser("dev-discard-plan")
+    s.add_argument("--transaction-id", required=True)
+
+    s = sub.add_parser("dev-discard-execute")
+    s.add_argument("--transaction-id", required=True)
+    s.add_argument("--expected-head-sha", default=None)
+    s.add_argument("--expected-candidate-tree-sha", default=None)
+    s.add_argument("--expected-branch", default=None)
+    s.add_argument("--expected-staged-path", action="append", default=[])
+    s.add_argument("--expected-unexpected-change", action="append", default=[])
+
     return p
 
 
@@ -3029,6 +3189,20 @@ def main() -> int:
             "run-study-pilot": cmd_run_study_pilot,
             "run-study": cmd_run_study,
             "study-summary": cmd_study_summary,
+            "dev-transaction-plan": cmd_dev_transaction_plan,
+            "dev-transaction-start": cmd_dev_transaction_start,
+            "dev-transaction-status": cmd_dev_transaction_status,
+            "dev-transaction-list": cmd_dev_transaction_list,
+            "dev-read": cmd_dev_read,
+            "dev-apply-patch-plan": cmd_dev_apply_patch_plan,
+            "dev-apply-patch-execute": cmd_dev_apply_patch_execute,
+            "dev-diff": cmd_dev_diff,
+            "dev-test-plan": cmd_dev_test_plan,
+            "dev-test-execute": cmd_dev_test_execute,
+            "dev-commit-plan": cmd_dev_commit_plan,
+            "dev-commit-execute": cmd_dev_commit_execute,
+            "dev-discard-plan": cmd_dev_discard_plan,
+            "dev-discard-execute": cmd_dev_discard_execute,
         }
         return commands[args.command](args, lab)
     except Exception as exc:

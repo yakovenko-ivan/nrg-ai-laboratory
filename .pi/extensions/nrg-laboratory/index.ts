@@ -1010,6 +1010,244 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+
+  // ===== Guarded development transactions (v1) =====
+  // These tools are the ONLY agent-facing path that may modify trusted
+  // infrastructure, and only inside an isolated Git worktree on an
+  // agent-dev/<tid> branch, through plan/confirm/execute + a transaction
+  // allowlist + a hard denylist + a self-protected TCB list. Ordinary
+  // write/edit roots are unchanged. The authoritative candidate state is the
+  // worktree index (candidate_tree_sha = git write-tree), not HEAD alone.
+
+  pi.registerTool({
+    name: "nrg_dev_transaction_start",
+    label: "NRG Dev Transaction Start",
+    description: "Start a guarded infrastructure-development transaction: verify a clean baseline, create an isolated Git worktree + agent-dev/<tid> branch, establish an explicit allowed-path set, and persist a transaction record. Bound to the confirmed plan (transaction_id, baseline_sha, allowed_paths). Requires confirmation.",
+    promptSnippet: "Start a guarded isolated development transaction for approved NRG laboratory infrastructure work",
+    promptGuidelines: [
+      "Use only for explicitly approved infrastructure work on the nrg-ai-laboratory repository.",
+      "The main checkout is never directly mutated; work happens in an isolated worktree under .local/dev_worktrees/.",
+      "Allowed paths must be repository-relative and must not include denied or self-protected TCB locations.",
+      "v1 does not push, merge, rebase, tag, or promote a runtime; promotion is out-of-band.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({ description: "Short issue/task name" }),
+      rationale: Type.String({ description: "Why this infrastructure change is needed" }),
+      allowed_paths: Type.Array(Type.String(), { minItems: 1, description: "Explicit repository-relative paths/globs this transaction may touch" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const planArgs = ["dev-transaction-plan", "--task", params.task, "--rationale", params.rationale];
+      for (const p of params.allowed_paths) planArgs.push("--allowed-path", p);
+      const plan = await bridge(planArgs, signal);
+      if (plan.error || !plan.can_start) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev transaction start requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Start guarded development transaction?",
+        `Create isolated worktree ${plan.worktree} on branch ${plan.development_branch} from ${plan.baseline_sha?.slice(0, 12)}. ` +
+        `Allowed paths: ${plan.allowed_paths.join(", ")}. The main checkout is not modified.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["dev-transaction-start", "--transaction-id", plan.transaction_id,
+                        "--task", params.task, "--rationale", params.rationale,
+                        "--baseline-sha", plan.baseline_sha];
+      for (const p of plan.allowed_paths) execArgs.push("--allowed-path", p);
+      return toolResult(await bridge(execArgs, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_status",
+    label: "NRG Dev Status",
+    description: "Read-only status of a guarded development transaction: baseline/current HEAD, candidate_tree_sha, branch/worktree, staged paths, unexpected changes, last test, commit state.",
+    promptSnippet: "Inspect a guarded development transaction's state",
+    promptGuidelines: ["Use nrg_dev_status before applying patches or committing; candidate_tree_sha identifies the exact tested code."],
+    parameters: Type.Object({
+      transaction_id: Type.String({ description: "Transaction id returned by nrg_dev_transaction_start" }),
+    }),
+    async execute(_id, params, signal) {
+      return toolResult(await bridge(["dev-transaction-status", "--transaction-id", params.transaction_id], signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_read",
+    label: "NRG Dev Read",
+    description: "Read-only bounded read from the isolated development worktree. Accepts only paths inside the worktree.",
+    promptSnippet: "Read a file from the isolated development worktree",
+    promptGuidelines: ["Use nrg_dev_read instead of shell archaeology to inspect the edited version of a file."],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      path: Type.String({ description: "Repository-relative path inside the worktree" }),
+      offset: Type.Optional(Type.Number({ minimum: 1 })),
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 2000 })),
+    }),
+    async execute(_id, params, signal) {
+      const args = ["dev-read", "--transaction-id", params.transaction_id, "--path", params.path];
+      if (params.offset !== undefined) args.push("--offset", String(params.offset));
+      if (params.limit !== undefined) args.push("--limit", String(params.limit));
+      return toolResult(await bridge(args, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_apply_patch",
+    label: "NRG Dev Apply Patch",
+    description: "Validate and apply an allowlisted patch artifact into the isolated development worktree index (candidate state). Execute is bound to the confirmed plan (patch SHA-256, head, candidate tree); a changed patch is rejected. Rejects pre-existing unexpected working-tree changes, out-of-allowlist, denied, self-protected-TCB, traversal, symlink-escape, and binary patches. Requires confirmation.",
+    promptSnippet: "Apply a reviewed patch into the isolated development worktree",
+    promptGuidelines: [
+      "The patch artifact must be authored under the configured studies workspace (agent_workspace/studies/<dev-study>/patches/).",
+      "Patches are staged into the worktree index; candidate_tree_sha (git write-tree) is the authoritative tested-state identity.",
+      "git apply --check --index must pass before the patch is applied.",
+      "Pre-existing unexpected working-tree changes are rejected so an unrelated change cannot produce an applied-but-unrecorded candidate state.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      patch: Type.String({ description: "Path to the .diff patch artifact under the studies workspace" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["dev-apply-patch-plan", "--transaction-id", params.transaction_id, "--patch", params.patch], signal);
+      if (plan.error || !plan.can_apply) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev patch apply requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Apply patch to development worktree?",
+        `Apply ${plan.touched_paths.length} path(s): ${plan.touched_paths.join(", ")}. ` +
+        `+${plan.insertions}/-${plan.deletions}. Patch SHA-256 ${plan.patch_sha256.slice(0, 12)}.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["dev-apply-patch-execute", "--transaction-id", params.transaction_id, "--patch", params.patch,
+                        "--expected-patch-sha256", plan.patch_sha256,
+                        "--expected-head-sha", plan.current_head_sha,
+                        "--expected-candidate-tree-sha", plan.applied_against_tree_sha];
+      return toolResult(await bridge(execArgs, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_diff",
+    label: "NRG Dev Diff",
+    description: "Read-only diff of the staged candidate state in the isolated development worktree: staged files, diff stat, unified diff, candidate_tree_sha, unexpected changes.",
+    promptSnippet: "Inspect the staged candidate diff of a guarded development worktree",
+    promptGuidelines: ["Use nrg_dev_diff for human review before committing; it must not hide unexpected files."],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+    }),
+    async execute(_id, params, signal) {
+      return toolResult(await bridge(["dev-diff", "--transaction-id", params.transaction_id], signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_test",
+    label: "NRG Dev Test",
+    description: "Run a named trusted test profile (diff_check, targeted_pytest, full_pytest, lab_doctor, lab_config_validate) in the isolated worktree. Execute is bound to the confirmed candidate_tree_sha, head, and branch; a changed candidate or stale HEAD is rejected. Refuses if unexpected working-tree changes exist (working tree must match candidate index). Fixed normalized commands only; no shell; NOT an OS sandbox. Requires confirmation.",
+    promptSnippet: "Run a trusted test profile in the isolated development worktree",
+    promptGuidelines: [
+      "Only named profiles from config/dev_transaction_policy.json are accepted.",
+      "targeted_pytest accepts exact repository-relative tests/*.py paths, optionally with one ::test_name node selector; no -k/keyword expressions.",
+      "Test results are bound to the exact candidate_tree_sha; a candidate state change during the test yields integrity_failed and is not bound as validation.",
+      "Pre-existing unexpected working-tree changes block test execution because pytest runs from the working tree, not the index.",
+      "Candidate Python runs with the local user's permissions; human confirmation is a real trust boundary.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      profile: Type.String({ description: "One of: diff_check, targeted_pytest, full_pytest, lab_doctor, lab_config_validate" }),
+      test_files: Type.Optional(Type.Array(Type.String(), { description: "Exact tests/*.py paths, optionally with ::test_name" })),
+      require_nrg: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const planArgs = ["dev-test-plan", "--transaction-id", params.transaction_id, "--profile", params.profile];
+      for (const tf of params.test_files ?? []) planArgs.push("--test-file", tf);
+      if (params.require_nrg) planArgs.push("--require-nrg");
+      const plan = await bridge(planArgs, signal);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev test execution requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Run development test profile?",
+        `Profile ${params.profile}. Command: ${plan.normalized_command.join(" ")}. ` +
+        `Candidate tree ${plan.candidate_tree_sha?.slice(0, 12)}. HEAD ${plan.current_head_sha?.slice(0, 12)}. ` +
+        `This executes candidate Python with local-user permissions.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["dev-test-execute", "--transaction-id", params.transaction_id, "--profile", params.profile,
+                        "--expected-candidate-tree-sha", plan.candidate_tree_sha,
+                        "--expected-head-sha", plan.current_head_sha,
+                        "--expected-branch", plan.current_branch];
+      for (const tf of params.test_files ?? []) execArgs.push("--test-file", tf);
+      if (params.require_nrg) execArgs.push("--require-nrg");
+      return toolResult(await bridge(execArgs, signal, 1_800_000));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_commit",
+    label: "NRG Dev Commit",
+    description: "Commit the validated staged candidate state on the agent-dev/<tid> branch only. Requires current-tree diff_check=pass and a current-tree pytest pass; rejects unexpected changes and current fail/integrity_failed. Execute is bound to the confirmed candidate_tree_sha, head, and branch; a stale HEAD (new commit with same tree) is rejected. No push/merge/rebase/tag. Requires confirmation.",
+    promptSnippet: "Commit the validated staged candidate state on the isolated development branch",
+    promptGuidelines: [
+      "Commits the staged candidate tree (git write-tree); HEAD-only identity is not trusted.",
+      "Current-tree validation (diff_check + a pytest profile) is required before commit.",
+      "Commits are created only on agent-dev/<tid>; main is never modified.",
+      "A new commit with the same tree between plan and execute is rejected as stale provenance.",
+      "v1 performs no push, merge, rebase, tag, or runtime promotion; human promotion is out-of-band.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+      message: Type.String(),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["dev-commit-plan", "--transaction-id", params.transaction_id, "--message", params.message], signal);
+      if (plan.error || !plan.can_commit) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev commit requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Commit staged candidate on development branch?",
+        `Commit ${plan.staged_paths.length} staged path(s) on ${plan.current_branch}. ` +
+        `Candidate tree ${plan.candidate_tree_sha?.slice(0, 12)}. HEAD ${plan.current_head_sha?.slice(0, 12)}. ` +
+        `diff_check=${plan.diff_check_pass}, pytest=${plan.pytest_pass}. ` +
+        `No push/merge/tag will occur.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["dev-commit-execute", "--transaction-id", params.transaction_id,
+                        "--message", params.message,
+                        "--expected-candidate-tree-sha", plan.candidate_tree_sha,
+                        "--expected-head-sha", plan.current_head_sha,
+                        "--expected-branch", plan.current_branch];
+      return toolResult(await bridge(execArgs, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_dev_discard",
+    label: "NRG Dev Discard",
+    description: "Remove only the isolated worktree and agent-dev/<tid> branch for a transaction. Never deletes main-worktree content or scientific artifacts; never recursively removes a non-canonical path. Execute is bound to the confirmed state (head, tree, branch, staged, unexpected); a state change after confirmation is rejected. Return codes from git worktree remove and git branch -D are verified. Requires confirmation.",
+    promptSnippet: "Discard an isolated development transaction worktree and branch",
+    promptGuidelines: [
+      "Use only to abandon a transaction; main checkout and scientific records are never touched.",
+      "The exact state at confirmation time is verified before cleanup; a post-confirmation change is rejected.",
+    ],
+    parameters: Type.Object({
+      transaction_id: Type.String(),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["dev-discard-plan", "--transaction-id", params.transaction_id], signal);
+      if (plan.error || !plan.can_discard) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "dev discard requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Discard development transaction?",
+        `Remove worktree ${plan.worktree} and branch ${plan.development_branch}. ` +
+        `HEAD ${plan.current_head_sha?.slice(0, 12)}, candidate tree ${plan.candidate_tree_sha?.slice(0, 12)}. ` +
+        `Main checkout is untouched.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = ["dev-discard-execute", "--transaction-id", params.transaction_id];
+      if (plan.current_head_sha) execArgs.push("--expected-head-sha", plan.current_head_sha);
+      if (plan.candidate_tree_sha) execArgs.push("--expected-candidate-tree-sha", plan.candidate_tree_sha);
+      if (plan.current_branch) execArgs.push("--expected-branch", plan.current_branch);
+      for (const sp of plan.staged_paths ?? []) execArgs.push("--expected-staged-path", sp);
+      for (const uc of plan.unexpected_changes ?? []) execArgs.push("--expected-unexpected-change", uc);
+      return toolResult(await bridge(execArgs, signal));
+    },
+  });
+
   pi.registerCommand("nrg-tools", {
     description: "Show registered and active NRG laboratory tools",
     handler: async (_args, ctx) => {

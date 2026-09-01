@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "configuration_source": "config/laboratory.toml",
   "agent_write_roots": [
     "paths.studies_root",
@@ -22,6 +22,8 @@
   "campaign_spec_policy": "agent_editable_in_definitions_with_execution_approval",
   "campaign_execution_policy": "explicit_user_confirmation_via_pi_tool",
   "trusted_infrastructure_policy": "no_agent_modification_without_explicit_out_of_band_user_action",
+  "dev_transaction_policy": "config/dev_transaction_policy.json",
+  "dev_transaction_policy_semantics": "trusted_infrastructure remains read-only except through the explicit guarded development transaction (nrg_dev_* tools); ordinary agent_write_roots are unchanged",
   "notes": [
     "The Pi extension enforces write/edit path restrictions and disables agent bash calls.",
     "The study execution wrapper detects raw-input mutation but is not an OS sandbox.",

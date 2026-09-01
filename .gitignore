@@ -12,6 +12,12 @@
 # A convenient local layout is .local/NRG, but the NRG repository may live
 # anywhere and be referenced from laboratory.local.toml.
 /.local/
+# Guarded development transactions (worktrees/records live under .local/).
+/.local/dev_worktrees/
+/.local/dev_transactions/
+# Durable hygiene rules (prevent dirty-workspace deadlock for dev transactions).
+/agent_workspace/portable_returns/
+*.bak
 
 # -----------------------------------------------------------------------------
 # Active scientific research state (never source-repository content)

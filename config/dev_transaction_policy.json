@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "worktrees_root": ".local/dev_worktrees",
+  "transactions_root": ".local/dev_transactions",
+  "patch_artifact_root": "agent_workspace/studies",
+  "patch_artifact_root_semantics": "Patch artifacts consumed by nrg_dev_apply_patch must resolve under the configured studies workspace, be regular files, and not escape through symlinks.",
+  "denylist": [
+    ".git/",
+    ".venv/",
+    ".local/",
+    "runs/",
+    "campaigns/",
+    "agent_workspace/portable_returns/",
+    "agent_workspace/studies/",
+    "config/laboratory.local.toml"
+  ],
+  "allowlist_semantics": "Entry ending '/' matches that directory and descendants; an exact entry matches exactly one file; an entry containing glob metacharacters (* ? [ ]) uses fnmatch glob semantics. Denylist and self_protected_paths override allowlist.",
+  "self_protected_paths": [
+    "agent_workspace/dev_transactions.py",
+    "config/dev_transaction_policy.json",
+    "agent_workspace/workspace_policy.json",
+    "agent_workspace/lab_bridge.py",
+    ".pi/extensions/nrg-laboratory/index.ts",
+    ".pi/extensions/nrg-laboratory/read_only_shell.ts",
+    "config/read_only_shell_policy.json",
+    "AGENTS.md"
+  ],
+  "self_protection_semantics": "Ordinary nrg_dev_* transactions must not rewrite the guarded-development trusted computing base. Changes to this security boundary require a separate out-of-band security bootstrap (or a future stronger security_boundary transaction class), not an ordinary development transaction.",
+  "allowed_test_profiles": [
+    "diff_check",
+    "targeted_pytest",
+    "full_pytest",
+    "lab_doctor",
+    "lab_config_validate"
+  ],
+  "test_profile_commands": {
+    "diff_check": "git diff --cached --check",
+    "lab_doctor": "python -m nrg_analysis.doctor --laboratory <worktree>/config/laboratory.toml --no-local [--require-nrg]",
+    "lab_config_validate": "python -m nrg_analysis.config_cli --laboratory <worktree>/config/laboratory.toml validate --no-runtime"
+  },
+  "max_patch_bytes": 524288,
+  "max_read_lines": 2000,
+  "test_path_pattern": "^tests/[A-Za-z0-9_./-]+\\.py$",
+  "test_node_selector_pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+  "test_execution_trust": "Test commands are fixed/normalized by trusted profiles; subprocess arguments are never passed through a shell; environment is sanitized; CWD/PYTHONPATH are bound to the isolated worktree. Candidate source state is checked before and after the test; a changed candidate state yields integrity_failed and is not bound as validation. Nevertheless candidate Python executed by pytest has the permissions of the local user; this is NOT an OS sandbox. Human confirmation before a test profile is a real trust boundary.",
+  "commit_validation_policy": "Commit requires current-tree diff_check=pass AND at least one current-tree pytest profile (targeted_pytest or full_pytest) with pass; a current-tree fail or integrity_failed result blocks commit; environment_blocked is not a passing substitute.",
+  "commit_branch_prefix": "agent-dev/"
+}
