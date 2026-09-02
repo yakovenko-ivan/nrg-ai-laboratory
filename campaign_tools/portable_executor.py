@@ -195,8 +195,8 @@ def read_config(path: Path) -> dict[str, Any]:
         "graceful_pause_timeout_seconds": max(
             1.0, float(execution.get("graceful_pause_timeout_seconds", 120.0))
         ),
-        "rerun_failed": bool(execution.get("rerun_failed", True)),
-        "continue_on_failure": bool(execution.get("continue_on_failure", False)),
+        "rerun_failed": bool(execution.get("rerun_failed", False)),
+        "continue_on_failure": bool(execution.get("continue_on_failure", True)),
         "limit_library_threads": bool(execution.get("limit_library_threads", True)),
         "require_exact_binary": bool(runtime.get("require_exact_binary", False)),
         "termination_profile_name": profile_name or None,
@@ -235,6 +235,79 @@ def verify_static_checksums(bundle_root: Path) -> list[str]:
 def verify_export_snapshot(bundle_root: Path) -> list[str]:
     return verify_checksum_file(bundle_root, "EXPORT_SNAPSHOT_CHECKSUMS.sha256")
 
+
+# Conservative classic-Windows path-length guard.  The nominal MAX_PATH limit on
+# classic Windows is 260 characters; we enforce 240 to leave deliberate headroom
+# for runtime-created suffixes (restart files, output segments, temporary names)
+# and for the external NRG/Fortran runtime's own path handling.  Python's own
+# long-path support does NOT imply the external executable/runtime is safe.
+# Phase-1 does not inspect or modify Windows registry/group-policy long-path
+# settings.
+WINDOWS_PATH_SAFE_LIMIT = 240
+
+
+def detected_platform() -> str:
+    """Return a normalized platform name for path-budget enforcement."""
+    return "Windows" if os.name == "nt" else platform.system()
+
+
+def collect_runtime_paths(bundle_root: Path, computing_module: Any = None) -> list[Path]:
+    """Collect actual resolved compute-host runtime paths for the bundle.
+
+    The scan is recursive and structure-agnostic so current and future nested
+    content (case directories, ``task_setup`` trees, setup/input files, mechanism
+    /thermo/transport resources, initial/restart ``data_output``, executor
+    metadata/configuration, nested results already present during resume) all
+    participate naturally without a hard-coded filename list.  Generation-host
+    provenance paths are deliberately not evaluated.
+    """
+    resolved_root = bundle_root.resolve()
+    paths: list[Path] = [resolved_root]
+    for path in resolved_root.rglob("*"):
+        paths.append(path.resolve())
+    if computing_module is not None:
+        cm = Path(str(computing_module))
+        if cm.exists():
+            paths.append(cm.resolve())
+    return paths
+
+
+def audit_path_budget(
+    bundle_root: Path,
+    computing_module: Any,
+    platform_name: str,
+    safe_limit: int,
+) -> dict[str, Any]:
+    """Measure actual resolved compute-host path lengths against a host budget.
+
+    This is a pure helper accepting an explicit platform indicator and safe limit
+    so the Windows policy can be exercised deterministically on Linux.  On
+    non-Windows hosts the Windows limit is reported as a diagnostic only and
+    never as a hard error.
+    """
+    entries = [
+        {"path": str(p), "length": len(str(p))}
+        for p in collect_runtime_paths(bundle_root, computing_module)
+    ]
+    # Longest first, with a stable secondary ordering by path string.
+    entries.sort(key=lambda item: (-item["length"], item["path"]))
+    max_observed = entries[0]["length"] if entries else 0
+    offending = [item for item in entries if item["length"] > safe_limit]
+    enforced = platform_name == "Windows"
+    ok = (not enforced) or (max_observed <= safe_limit)
+    payload: dict[str, Any] = {
+        "platform": platform_name,
+        "enforced": enforced,
+        "safe_limit": safe_limit,
+        "max_observed_length": max_observed,
+        "ok": ok,
+        "offending_paths": offending,
+    }
+    if enforced and not ok:
+        payload["recommendation"] = (
+            "Extract or move the portable bundle to a shorter root path."
+        )
+    return payload
 
 
 def _has_initial_data_output(case_path: Path) -> bool:
@@ -303,8 +376,25 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
             "runtime.require_exact_binary=true"
         )
 
+    path_budget = audit_path_budget(
+        bundle_root, config["computing_module"], detected_platform(), WINDOWS_PATH_SAFE_LIMIT
+    )
+    path_budget_problems: list[str] = []
+    if path_budget["enforced"] and not path_budget["ok"]:
+        path_budget_problems.append(
+            "host runtime path budget exceeded: max_observed_length="
+            f"{path_budget['max_observed_length']} > safe_limit={path_budget['safe_limit']}"
+        )
+
+    valid = (
+        not static_problems
+        and not snapshot_problems
+        and not case_problems
+        and not termination_problems
+        and not path_budget_problems
+    )
     return {
-        "valid": not static_problems and not snapshot_problems and not case_problems and not termination_problems,
+        "valid": valid,
         "bundle_id": manifest.get("bundle_id"),
         "campaign_contract_sha256": manifest.get("campaign_contract_sha256"),
         "case_count": len(rows),
@@ -314,6 +404,8 @@ def validate_bundle(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
         "case_contract_problems": case_problems,
         "termination_integrity_problems": termination_problems,
         "termination": termination_meta,
+        "path_budget": path_budget,
+        "path_budget_problems": path_budget_problems,
         "runtime": {
             "computing_module": str(config["computing_module"]),
             "computing_module_sha256": exe_sha,
@@ -854,6 +946,16 @@ def run_case(
     return str(status["status"]), must_pause_runner
 
 
+def collect_failed_case_ids(rows: list[dict[str, str]], root: Path) -> list[str]:
+    """Return failed case IDs in cases.csv order from final per-case states."""
+    failed: list[str] = []
+    for row in rows:
+        st = current_status(case_dir(root, row)) or {}
+        if str(st.get("status", "")).lower() == "failed":
+            failed.append(row["case_id"])
+    return failed
+
+
 def status_payload(root: Path) -> dict[str, Any]:
     manifest = read_json(root / "bundle_manifest.json")
     rows = load_cases(root)
@@ -881,6 +983,17 @@ def status_payload(root: Path) -> dict[str, Any]:
             lock_owner = read_json(owner_path)
         except Exception:
             lock_owner = None
+    job_path = root / "executor_job.json"
+    job = read_json(job_path) if job_path.is_file() else {}
+    # Completion summary is completed-only metadata; do not fabricate it for
+    # active/paused/stopped/failed/non-completed jobs.
+    completion: dict[str, Any] = {}
+    if isinstance(job, dict) and str(job.get("state", "")).lower() == "completed":
+        completion = {
+            "completion_outcome": job.get("completion_outcome"),
+            "failed_case_count": job.get("failed_case_count", 0),
+            "failed_case_ids": job.get("failed_case_ids", []),
+        }
     return {
         "bundle_id": manifest.get("bundle_id"),
         "campaign_contract_sha256": manifest.get("campaign_contract_sha256"),
@@ -888,6 +1001,8 @@ def status_payload(root: Path) -> dict[str, Any]:
         "counts": dict(sorted(counts.items())),
         "active_cases": active,
         "executor_lock": lock_owner,
+        "executor_job": job,
+        "completion": completion,
         "control": read_json(control_file(root)) if control_file(root).is_file() else None,
         "sample": sample,
     }
@@ -991,7 +1106,25 @@ def run_bundle(root: Path, config_path: Path) -> int:
                 job_state = "paused"
         else:
             job_state = "completed"
-        job.update(state=job_state, active_case_id=None, finished_at_utc=utc_now())
+        # Completion outcome metadata is completed-only: it is attached solely
+        # when the terminal executor state is "completed", never for fail-fast,
+        # stopped, paused, restart-required, or otherwise non-completed jobs.
+        completion_payload: dict[str, Any] = {}
+        if job_state == "completed":
+            failed_case_ids = collect_failed_case_ids(rows, root)
+            completion_payload = {
+                "completion_outcome": (
+                    "completed_with_failures" if failed_case_ids else "completed_cleanly"
+                ),
+                "failed_case_count": len(failed_case_ids),
+                "failed_case_ids": failed_case_ids,
+            }
+        job.update(
+            state=job_state,
+            active_case_id=None,
+            finished_at_utc=utc_now(),
+            **completion_payload,
+        )
         write_json(root / "executor_job.json", job)
     return 0
 

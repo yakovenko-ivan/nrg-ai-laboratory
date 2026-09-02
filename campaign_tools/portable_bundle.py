@@ -214,8 +214,13 @@ backend = "local"
 threads = 8
 poll_seconds = 0.25
 graceful_pause_timeout_seconds = 120.0
-rerun_failed = true
-continue_on_failure = false
+# Production defaults (Phase-1 hardening): a failed case is preserved (not
+# converted to success) while later runnable cases continue, and an ordinary
+# resume skips already-failed cases. These two keys are independent controls:
+#   continue_on_failure = false  -> restore strict fail-fast behavior
+#   rerun_failed = true          -> allow previously failed cases to rerun on resume
+rerun_failed = false
+continue_on_failure = true
 limit_library_threads = true
 
 [termination]
