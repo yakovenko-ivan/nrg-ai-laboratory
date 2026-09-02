@@ -122,6 +122,17 @@ class RepositoryHygieneV060Tests(unittest.TestCase):
         self.assertFalse((REPO_ROOT / "PI_INTEGRATION.md").exists())
         self.assertFalse((REPO_ROOT / "VALIDATION.md").exists())
 
+    def test_pytest_discovery_is_constrained_to_tracked_tests(self):
+        # Ignored/local research studies under agent_workspace/studies/ may
+        # legitimately contain historical Python files named test_*.py (for
+        # example one-time bootstrap verification copies), but they are not
+        # part of the permanent tracked repository test suite and must not be
+        # collected by default.  The positive collection boundary lives in
+        # pyproject.toml so ordinary `python -m pytest` discovery only walks
+        # the tracked tests/ tree.
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(data["tool"]["pytest"]["ini_options"]["testpaths"], ["tests"])
+
 
 if __name__ == "__main__":
     unittest.main()

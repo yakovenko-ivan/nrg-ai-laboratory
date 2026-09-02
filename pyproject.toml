@@ -41,3 +41,12 @@ agent_workspace = [
 
 [tool.setuptools.dynamic]
 version = {attr = "nrg_analysis._version.__version__"}
+
+[tool.pytest.ini_options]
+# Positive collection boundary: ordinary repository pytest discovery must use
+# the permanent tracked test suite under tests/.  Ignored/local research studies
+# under agent_workspace/studies/ may legitimately contain historical Python files
+# named test_*.py (e.g. one-time bootstrap verification copies), but they are not
+# part of the permanent repository test suite and must not be collected by
+# default.
+testpaths = ["tests"]
