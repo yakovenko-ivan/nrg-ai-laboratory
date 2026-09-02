@@ -1,14 +1,20 @@
-"""Disposable dynamic test suite for guarded development transactions (v1, v6 installer-corrected).
+"""Permanent test suite for the installed guarded-development transaction engine.
 
 Tests run in temporary Git repositories created under tempfile — never against
-production data.  46 tests cover the V4 transaction corrections plus V5/V6 installer integration and cumulative multi-operation idempotency.
+production data.  They exercise the installed transaction engine and the
+semantic write/edit tools: transaction start/status/read, allowlist/denylist
+and self-protection, candidate-tree/HEAD/branch integrity, semantic write/edit
+behavior, canonical patch generation, rollback/persistence failure behavior,
+and test validation and commit/discard safeguards.
+
+The one-time out-of-band bootstrap installer
+(agent_workspace/studies/guarded_dev_bootstrap/) is intentionally not a test
+fixture here; it is a gitignored local artifact and must not be required by a
+fresh worktree or clone.
 
 Run:  python -m pytest tests/test_dev_transactions.py -q
 """
 
-import contextlib
-import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -21,7 +27,6 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "config" / "dev_transaction_policy.json"
 INDEX = ROOT / ".pi" / "extensions" / "nrg-laboratory" / "index.ts"
 WORKSPACE_POLICY = ROOT / "agent_workspace" / "workspace_policy.json"
-BOOTSTRAP = ROOT / "agent_workspace" / "studies" / "guarded_dev_bootstrap" / "bootstrap_apply.py"
 
 from agent_workspace import dev_transactions as dev  # noqa: E402
 
@@ -419,264 +424,7 @@ class DevTransactionTests(unittest.TestCase):
             dev.discard_execute(self.lab, res["transaction_id"])
         self.assertTrue((victim / "keep.txt").exists())
 
-    # 25. corrupted installer reference rejected
-    def test_corrupted_installer_reference_rejected(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            ref_dir = Path(td)
-            for name in mod.EXPECTED_REFERENCE_SHA:
-                shutil.copy2(BOOTSTRAP.parent / "patches" / "reference" / name, ref_dir / name)
-            target = ref_dir / "dev_transaction_policy.json"
-            target.write_text("CORRUPTED", encoding="utf-8")
-            problems = mod.verify_references(ref_dir)
-            self.assertTrue(any("dev_transaction_policy.json" in p for p in problems))
-
-    def test_verify_references_accepts_clean(self):
-        mod = self._load_installer()
-        ref_dir = BOOTSTRAP.parent / "patches" / "reference"
-        problems = mod.verify_references(ref_dir)
-        self.assertEqual(problems, [])
-
-    # 26. bootstrap installer rejects unrelated tracked dirty baseline
-    def test_installer_rejects_dirty_baseline(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            # set HEAD to the expected baseline
-            head = _git(repo, "rev-parse", "HEAD").strip()
-            mod.EXPECTED_BASELINE_SHA = head  # temporarily patch for test
-            # make a tracked file dirty (unstaged modification)
-            (repo / "README.md").write_text("# dirty\n", encoding="utf-8")
-            dirty = mod._tracked_dirty_paths(repo)
-            self.assertTrue(len(dirty) > 0)
-            self.assertIn("README.md", dirty)
-
-    # 27. .bak and agent_workspace/portable_returns/ are ignored after bootstrap
-    def test_bak_and_portable_returns_ignored_after_bootstrap(self):
-        mod = self._load_installer()
-        # Verify the GITIGNORE_INSERT includes the hygiene rules
-        insert = mod.GITIGNORE_INSERT
-        self.assertIn("*.bak", insert)
-        self.assertIn("/agent_workspace/portable_returns/", insert)
-        # Verify in a real git repo that the rules actually ignore the paths
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            # apply the hygiene rules to .gitignore
-            gi = (repo / ".gitignore").read_text(encoding="utf-8")
-            gi += insert
-            (repo / ".gitignore").write_text(gi, encoding="utf-8")
-            subprocess.run(["git", "add", ".gitignore"], cwd=str(repo), check=True)
-            subprocess.run(["git", "commit", "-q", "-m", "add hygiene rules"], cwd=str(repo), check=True)
-            # create representative ignored artifacts
-            (repo / "some_file.py.bak").write_text("backup", encoding="utf-8")
-            pr = repo / "agent_workspace" / "portable_returns"
-            pr.mkdir(parents=True, exist_ok=True)
-            (pr / "results.zip").write_text("dummy", encoding="utf-8")
-            # git status must NOT list them
-            status = _git(repo, "status", "--porcelain")
-            self.assertNotIn(".bak", status)
-            self.assertNotIn("portable_returns", status)
-
-
-    # 28. installer CLI --check/--apply and post-apply idempotency
-    def test_installer_cli_check_apply_idempotency(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            baseline = "# tmp\n"
-            op = {
-                "file": "README.md",
-                "old": baseline,
-                "new": baseline + "BOOTSTRAP_MARKER\n",
-                "marker": "BOOTSTRAP_MARKER",
-            }
-
-            # Isolate the installer state machine from repository-specific anchors
-            # while exercising the real CLI parser, evaluate(), apply(), git state
-            # checks, and second --check idempotency behavior.
-            mod.EXPECTED_BASELINE_SHA = _git(repo, "rev-parse", "HEAD").strip()
-            mod.PRE_IMAGE_SHA = {"README.md": mod.sha256_text(baseline)}
-            mod.NEW_FILES = []
-            mod.build_ops = lambda: [op]
-            mod.verify_references = lambda _ref_dir: []
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 0)
-            first = json.loads(out.getvalue())
-            self.assertTrue(first["ready_to_apply"])
-            self.assertFalse(first["already_applied"])
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--apply"])
-            self.assertEqual(rc, 0)
-            applied = json.loads(out.getvalue())
-            self.assertTrue(applied["post_apply_verified"])
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 0)
-            second = json.loads(out.getvalue())
-            self.assertFalse(second["ready_to_apply"])
-            self.assertTrue(second["already_applied"])
-            self.assertEqual(second["problems"], [])
-
-    # 29. unrelated tracked drift is still rejected after exact bootstrap apply
-    def test_installer_post_apply_rejects_unrelated_tracked_drift(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            baseline = "# tmp\n"
-            op = {
-                "file": "README.md",
-                "old": baseline,
-                "new": baseline + "BOOTSTRAP_MARKER\n",
-                "marker": "BOOTSTRAP_MARKER",
-            }
-            mod.EXPECTED_BASELINE_SHA = _git(repo, "rev-parse", "HEAD").strip()
-            mod.PRE_IMAGE_SHA = {"README.md": mod.sha256_text(baseline)}
-            mod.NEW_FILES = []
-            mod.build_ops = lambda: [op]
-            mod.verify_references = lambda _ref_dir: []
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(mod.main(["--root", str(repo), "--apply"]), 0)
-
-            # This is not an expected bootstrap post-image path and must block.
-            (repo / "tests" / "test_noop.py").write_text(
-                "def test_ok():\n    assert 2 == 2\n", encoding="utf-8"
-            )
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 2)
-            report = json.loads(out.getvalue())
-            self.assertFalse(report["already_applied"])
-            self.assertTrue(
-                any("unexpected tracked working-tree modifications" in p
-                    for p in report["problems"])
-            )
-
-
-    # 30. multi-operation tracked files use the cumulative final post-image
-    def test_installer_multi_operation_file_cumulative_idempotency(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            baseline = "# tmp\nSECOND\n"
-            (repo / "README.md").write_text(baseline, encoding="utf-8")
-            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
-            subprocess.run(
-                ["git", "commit", "-q", "-m", "multi-op baseline"],
-                cwd=str(repo), check=True,
-            )
-
-            op1 = {
-                "file": "README.md",
-                "old": "# tmp\n",
-                "new": "# tmp\nONE\n",
-                "marker": "ONE",
-            }
-            op2 = {
-                "file": "README.md",
-                "old": "SECOND\n",
-                "new": "SECOND\nTWO\n",
-                "marker": "TWO",
-            }
-
-            mod.EXPECTED_BASELINE_SHA = _git(repo, "rev-parse", "HEAD").strip()
-            mod.PRE_IMAGE_SHA = {"README.md": mod.sha256_text(baseline)}
-            mod.NEW_FILES = []
-            mod.build_ops = lambda: [op1, op2]
-            mod.verify_references = lambda _ref_dir: []
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 0)
-            first = json.loads(out.getvalue())
-            self.assertTrue(first["ready_to_apply"])
-            self.assertEqual(
-                {r["status"] for r in first["modifications"]}, {"will_apply"}
-            )
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--apply"])
-            self.assertEqual(rc, 0)
-            applied = json.loads(out.getvalue())
-            self.assertTrue(applied["post_apply_verified"])
-            self.assertEqual(
-                (repo / "README.md").read_text(encoding="utf-8"),
-                "# tmp\nONE\nSECOND\nTWO\n",
-            )
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 0)
-            second = json.loads(out.getvalue())
-            self.assertTrue(second["already_applied"])
-            self.assertFalse(second["ready_to_apply"])
-            self.assertEqual(second["problems"], [])
-            self.assertEqual(
-                {r["status"] for r in second["modifications"]},
-                {"already_applied"},
-            )
-
-    # 31. an intermediate/partial multi-operation state is drift, not "applied"
-    def test_installer_partial_multi_operation_state_rejected(self):
-        mod = self._load_installer()
-        with tempfile.TemporaryDirectory() as td:
-            repo = _make_repo(td)
-            baseline = "# tmp\nSECOND\n"
-            (repo / "README.md").write_text(baseline, encoding="utf-8")
-            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
-            subprocess.run(
-                ["git", "commit", "-q", "-m", "multi-op baseline"],
-                cwd=str(repo), check=True,
-            )
-
-            op1 = {
-                "file": "README.md",
-                "old": "# tmp\n",
-                "new": "# tmp\nONE\n",
-                "marker": "ONE",
-            }
-            op2 = {
-                "file": "README.md",
-                "old": "SECOND\n",
-                "new": "SECOND\nTWO\n",
-                "marker": "TWO",
-            }
-
-            mod.EXPECTED_BASELINE_SHA = _git(repo, "rev-parse", "HEAD").strip()
-            mod.PRE_IMAGE_SHA = {"README.md": mod.sha256_text(baseline)}
-            mod.NEW_FILES = []
-            mod.build_ops = lambda: [op1, op2]
-            mod.verify_references = lambda _ref_dir: []
-
-            # Simulate a historical installer that applied only the first step.
-            (repo / "README.md").write_text(
-                "# tmp\nONE\nSECOND\n", encoding="utf-8"
-            )
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = mod.main(["--root", str(repo), "--check"])
-            self.assertEqual(rc, 2)
-            report = json.loads(out.getvalue())
-            self.assertFalse(report["already_applied"])
-            self.assertFalse(report["ready_to_apply"])
-            self.assertTrue(
-                any("cumulative bootstrap post-image" in p
-                    for p in report["problems"])
-            )
-
-    # 32-41. semantic write/edit interface (trusted engine authors patch artifacts)
+    # Semantic write/edit interface (trusted engine authors patch artifacts)
     def test_semantic_write_create_stages_and_audits(self):
         res = self._start(allow=("tests/",))
         content = "def test_semantic():\n    assert True\n"
@@ -819,13 +567,6 @@ class DevTransactionTests(unittest.TestCase):
         patch = Path(out["canonical_patch_artifact"]).read_text(encoding="utf-8")
         self.assertIn("-    assert 1 == 1", patch)
         self.assertIn("+    assert 9 == 9", patch)
-
-    # --- helper for installer tests ---
-    def _load_installer(self):
-        spec = importlib.util.spec_from_file_location("bootstrap_apply", BOOTSTRAP)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
 
     # --- ordinary behavior unaffected ---
     def test_dev_tools_do_not_broaden_write_roots(self):

@@ -40,6 +40,10 @@ class RepositoryHygieneV060Tests(unittest.TestCase):
             "/runs/",
             "/agent_workspace/studies/*",
             "!/agent_workspace/studies/_template/",
+            # Durable hygiene rules that prevent dirty-workspace deadlocks for
+            # guarded development transactions and portable result returns.
+            "/agent_workspace/portable_returns/",
+            "*.bak",
         ):
             self.assertIn(rule, text)
 
