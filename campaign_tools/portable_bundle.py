@@ -284,61 +284,6 @@ exits through the expected graceful `external_stop_request` contract.
 Restart checkpoints are raw NRG binary state and should only be moved between
 binary-compatible NRG runtimes.
 '''
-
-
-def _portable_termination_sources(lab: Laboratory) -> tuple[Path, Path]:
-    core = (lab.research_root / "nrg_analysis" / "quasistationary_core.py").resolve()
-    registry = lab.termination_profiles.resolve()
-    return core, registry
-
-
-def _validate_default_profile(registry: Path) -> None:
-    data = read_json(registry)
-    profiles = data.get("profiles") if isinstance(data, dict) else None
-    if not isinstance(profiles, dict) or DEFAULT_TERMINATION_PROFILE not in profiles:
-        raise ValueError(
-            f"default portable termination profile {DEFAULT_TERMINATION_PROFILE!r} "
-            f"not found in {registry}"
-        )
-
-
-def _source_resource_contract(cases: Path) -> dict[str, Any] | None:
-    manifest = cases.parent / "campaign_manifest.json"
-    if not manifest.is_file():
-        return None
-    payload = read_json(manifest)
-    contract = payload.get("task_setup_resources")
-    return contract if isinstance(contract, dict) else None
-
-
-def _verify_prepared_resource_contract(case_path: Path, contract: dict[str, Any] | None) -> list[str]:
-    if not contract:
-        return []
-    problems: list[str] = []
-    task_setup = case_path / "task_setup"
-    entries: list[tuple[str, dict[str, Any]]] = []
-    for group in ("kinetic_mechanisms", "thermophysical_data"):
-        table = contract.get(group, {})
-        if isinstance(table, dict):
-            for key, value in table.items():
-                if isinstance(value, dict):
-                    entries.append((f"{group}.{key}", value))
-    for label, item in entries:
-        rel = str(item.get("relative_path") or "").strip()
-        expected = str(item.get("sha256") or "").strip()
-        if not rel or not expected:
-            problems.append(f"{label}: incomplete resource provenance entry")
-            continue
-        target = task_setup / Path(*PurePosixPath(rel.replace("\\", "/")).parts)
-        if not target.is_file():
-            problems.append(f"{label}: prepared resource missing: {rel}")
-            continue
-        observed = sha256_file(target)
-        if observed != expected:
-            problems.append(f"{label}: prepared resource checksum mismatch: {rel}")
-    return problems
-
-
 DEFAULT_TERMINATION_PROFILE = "0d_cv_post_ignition_quasistationary_v2"
 
 
@@ -395,6 +340,557 @@ def _verify_prepared_resource_contract(case_path: Path, contract: dict[str, Any]
     return problems
 
 
+# ---------------------------------------------------------------------------
+# Managed portable artifact roots and transport-artifact cleanup
+#
+# ``runs/`` is the single authoritative heavy scientific record.  Portable
+# export bundles and returned result archives are *transient transport
+# artifacts* that live under ``<research_root>/.local/portable/``.  A
+# successful verified import writes a durable lightweight receipt under
+# ``<campaign>/_imports/`` and, by default, reclaims the matching managed
+# transport artifacts.  Legacy laboratory-managed locations
+# (``<campaign_root>/exports/`` and
+# ``<research_root>/agent_workspace/portable_returns/``) are recognised for
+# cleanup only; no new artifacts are written there.
+#
+# Deletion safety is provenance-based (managed-root containment + manifest /
+# receipt proof), never filename-based.  ``runs/`` is never a cleanup
+# candidate.  No intra-campaign file deduplication, hardlinks, reflinks, or
+# compression is performed.
+# ---------------------------------------------------------------------------
+
+
+def managed_portable_root(lab: Laboratory) -> Path:
+    """Transient managed transport-artifact root for portable bundles/returns."""
+    return (lab.research_root / ".local" / "portable").resolve()
+
+
+def managed_exports_root(lab: Laboratory) -> Path:
+    """Default destination for new portable export bundles (transient)."""
+    return (managed_portable_root(lab) / "exports").resolve()
+
+
+def managed_returns_root(lab: Laboratory) -> Path:
+    """Default managed location for returned result archives (transient)."""
+    return (managed_portable_root(lab) / "returns").resolve()
+
+
+def legacy_exports_root(lab: Laboratory) -> Path:
+    """Historical laboratory-managed export location; cleanup-discoverable only."""
+    return (lab.campaign_root / "exports").resolve()
+
+
+def legacy_returns_root(lab: Laboratory) -> Path:
+    """Historical laboratory-managed return location; cleanup-discoverable only."""
+    return (lab.research_root / "agent_workspace" / "portable_returns").resolve()
+
+
+def _export_roots(lab: Laboratory) -> list[tuple[Path, str]]:
+    return [
+        (managed_exports_root(lab), "managed_exports"),
+        (legacy_exports_root(lab), "legacy_exports"),
+    ]
+
+
+def _return_roots(lab: Laboratory) -> list[tuple[Path, str]]:
+    return [
+        (managed_returns_root(lab), "managed_returns"),
+        (legacy_returns_root(lab), "legacy_returns"),
+    ]
+
+
+def _strictly_inside(path: Path, root: Path) -> bool:
+    """Return True only when *path* resolves to a strict descendant of *root*.
+
+    Rejects ``..`` traversal, symlink escapes, the root itself, and arbitrary
+    external paths.  Symlink resolution follows links so an in-root symlink
+    pointing outside is correctly rejected.
+    """
+    try:
+        resolved = path.resolve(strict=False)
+        base = root.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    if resolved == base:
+        return False
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _recursive_bytes(path: Path) -> int:
+    """Recursive byte size of a file or directory tree (0 on error/missing)."""
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    if path.is_dir():
+        total = 0
+        for sub in path.rglob("*"):
+            if sub.is_file():
+                try:
+                    total += sub.stat().st_size
+                except OSError:
+                    pass
+        return total
+    return 0
+
+
+def _discover_import_receipts(lab: Laboratory) -> list[dict[str, Any]]:
+    """Discover durable ``_imports/*.json`` receipts beneath the campaigns root.
+
+    Each receipt is proof of a scientifically successful import: receipts are
+    only written after verified results have been overlaid onto canonical
+    ``runs/``.
+    """
+    receipts: list[dict[str, Any]] = []
+    root = lab.campaign_root.resolve()
+    if not root.is_dir():
+        return receipts
+    for imports_dir in sorted(root.rglob("_imports")):
+        if not imports_dir.is_dir():
+            continue
+        for receipt_path in sorted(imports_dir.glob("*.json")):
+            try:
+                data = read_json(receipt_path)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            receipts.append({"path": str(receipt_path.resolve()), "data": data})
+    return receipts
+
+
+def _archive_bundle_id(path: Path) -> str | None:
+    """Read ``bundle_id`` from a returned results ZIP manifest without extracting."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            _safe_zip_members(zf)
+            manifest = _zip_json(zf, "results_manifest.json")
+            bid = str(manifest.get("bundle_id") or "")
+            return bid or None
+    except Exception:
+        return None
+
+
+def _parse_utc(value: str) -> datetime | None:
+    """Parse an ISO-8601 UTC-aware timestamp.
+
+    Returns ``None`` for missing/malformed/naive values so that temporal proof
+    fails closed rather than authorizing deletion by lexicographic guesswork.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt
+
+
+def _classify_returned_archive(
+    path: Path, lab: Laboratory, receipts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Classify a returned result ZIP for cleanup safety (fail closed).
+
+    Deletable only when ALL are proven: strict managed/legacy return-root
+    containment; a valid readable results ZIP; a non-empty archive ``bundle_id``;
+    a non-empty receipt ``bundle_id``; exact archive/receipt ``bundle_id``
+    equality; exact current archive SHA-256 equality with the receipt's
+    ``results_archive_sha256``; and a matching successful import receipt.
+    Hash equality alone is insufficient.
+    """
+    root_type: str | None = None
+    for root, rtype in _return_roots(lab):
+        if _strictly_inside(path, root):
+            root_type = rtype
+            break
+    base: dict[str, Any] = {
+        "kind": "returned_archive",
+        "path": str(path),
+        "root_type": root_type,
+        "bundle_id": None,
+        "campaign_contract_sha256": None,
+        "bytes": _recursive_bytes(path),
+        "classification": "external",
+        "can_delete": False,
+        "reason": "archive outside managed/legacy return roots; never auto-deleted",
+    }
+    if root_type is None:
+        return base
+    archive_bid = _archive_bundle_id(path)
+    base["bundle_id"] = archive_bid
+    if not archive_bid:
+        base.update({"classification": "unreadable_or_missing_identity",
+                     "reason": "archive missing/unreadable results manifest or bundle_id"})
+        return base
+    try:
+        current_hash = sha256_file(path)
+    except OSError:
+        base.update({"classification": "unreadable", "reason": "could not hash archive"})
+        return base
+    bid_match = False
+    for receipt in receipts:
+        rdata = receipt["data"]
+        r_bid = str(rdata.get("bundle_id") or "")
+        r_hash = str(rdata.get("results_archive_sha256") or "")
+        if r_bid and r_bid == archive_bid:
+            bid_match = True
+            if r_hash and r_hash == current_hash:
+                base["campaign_contract_sha256"] = (
+                    str(rdata.get("campaign_contract_sha256") or "") or None
+                )
+                base.update({"classification": "safe_imported", "can_delete": True,
+                             "reason": "matching successful import receipt, exact bundle_id and hash proof"})
+                return base
+    if bid_match:
+        base.update({"classification": "hash_mismatch",
+                     "reason": "receipt bundle_id matches but archive hash differs"})
+    else:
+        base.update({"classification": "no_receipt",
+                     "reason": "no matching import receipt with agreeing non-empty bundle_id"})
+    return base
+
+
+def _classify_export(
+    path: Path,
+    lab: Laboratory,
+    receipts: list[dict[str, Any]],
+    include_unimported: bool = False,
+) -> dict[str, Any]:
+    """Classify an expanded export directory for cleanup safety (fail closed).
+
+    Deletable with a matching receipt only when: strict managed/legacy export
+    containment; ``bundle_manifest.json`` parses; non-empty ``bundle_id`` and
+    ``campaign_contract_sha256``; no executor lock; and parsed-UTC temporal proof
+    that the matching import occurred at or after export creation.  In advanced
+    ``include_unimported`` mode an abandoned export is deletable only with
+    complete identity and no lock.  Missing/malformed/incomparable timestamps
+    fail closed.
+    """
+    root_type: str | None = None
+    for root, rtype in _export_roots(lab):
+        if _strictly_inside(path, root):
+            root_type = rtype
+            break
+    base: dict[str, Any] = {
+        "kind": "expanded_export",
+        "path": str(path),
+        "root_type": root_type,
+        "bundle_id": None,
+        "campaign_contract_sha256": None,
+        "bytes": _recursive_bytes(path),
+        "classification": "external",
+        "can_delete": False,
+        "reason": "export outside managed/legacy export roots",
+    }
+    if root_type is None:
+        return base
+    manifest_path = path / "bundle_manifest.json"
+    if not manifest_path.is_file():
+        base.update({"classification": "manual_review",
+                     "reason": "bundle_manifest.json missing"})
+        return base
+    try:
+        manifest = read_json(manifest_path)
+    except Exception:
+        base.update({"classification": "manual_review",
+                     "reason": "bundle_manifest.json did not parse"})
+        return base
+    bid = str(manifest.get("bundle_id") or "")
+    contract_sha = str(manifest.get("campaign_contract_sha256") or "")
+    created_at_raw = str(manifest.get("created_at_utc") or "")
+    base["bundle_id"] = bid or None
+    base["campaign_contract_sha256"] = contract_sha or None
+    # An executor lock means the export may still be in active use.
+    if (path / ".executor.lock" / "owner.json").is_file():
+        base.update({"classification": "locked", "can_delete": False,
+                     "reason": "executor lock present; not auto-deleted"})
+        return base
+    matching = [
+        r for r in receipts
+        if bid and contract_sha
+        and str(r["data"].get("bundle_id") or "") == bid
+        and str(r["data"].get("campaign_contract_sha256") or "") == contract_sha
+    ]
+    if matching:
+        created_dt = _parse_utc(created_at_raw)
+        import_dts = [
+            d for d in (
+                _parse_utc(str(r["data"].get("imported_at_utc") or "")) for r in matching
+            )
+            if d is not None
+        ]
+        if created_dt is not None and import_dts and max(import_dts) >= created_dt:
+            base.update({"classification": "safe_imported", "can_delete": True,
+                         "reason": "matching successful import receipt with temporal proof"})
+        else:
+            base.update({"classification": "temporal_mismatch", "can_delete": False,
+                         "reason": "export created after latest matching import, or timestamps missing/malformed"})
+        return base
+    if include_unimported:
+        if bid and contract_sha:
+            base.update({"classification": "unimported_export_abandoned", "can_delete": True,
+                         "reason": "explicit include_unimported_exports; abandoned unlocked export with complete identity"})
+        else:
+            base.update({"classification": "incomplete_identity", "can_delete": False,
+                         "reason": "unimported export missing bundle_id or campaign_contract_sha256"})
+    else:
+        base.update({"classification": "no_receipt", "can_delete": False,
+                     "reason": "no matching successful import receipt"})
+    return base
+
+
+def cleanup_plan(lab: Laboratory, include_unimported_exports: bool = False) -> dict[str, Any]:
+    """Read-only cleanup plan for managed/legacy portable transport artifacts.
+
+    Discovers all current and legacy managed portable artifacts, classifies each
+    by provenance, and reports which are safe to delete.  ``runs/`` is never a
+    candidate.  Unimported returned archives are never deletable; abandoned
+    unimported exports are deletable only with ``include_unimported_exports``.
+    """
+    receipts = _discover_import_receipts(lab)
+    artifacts: list[dict[str, Any]] = []
+    for root, _rtype in _return_roots(lab):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_file() and entry.suffix.lower() == ".zip":
+                artifacts.append(_classify_returned_archive(entry, lab, receipts))
+    for root, _rtype in _export_roots(lab):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and (entry / "bundle_manifest.json").is_file():
+                artifacts.append(
+                    _classify_export(entry, lab, receipts, include_unimported=include_unimported_exports)
+                )
+    artifacts.sort(key=lambda a: (a["kind"], a["path"]))
+    safe = [a for a in artifacts if a["can_delete"]]
+    review = [a for a in artifacts if a["classification"] in ("manual_review", "temporal_mismatch")]
+    return {
+        "artifacts": artifacts,
+        "reclaimable_bytes": sum(a["bytes"] for a in safe),
+        "artifact_count": len(artifacts),
+        "safe_delete_count": len(safe),
+        "manual_review_count": len(review),
+        "managed_roots": {
+            "exports": str(managed_exports_root(lab)),
+            "returns": str(managed_returns_root(lab)),
+            "legacy_exports": str(legacy_exports_root(lab)),
+            "legacy_returns": str(legacy_returns_root(lab)),
+        },
+        "include_unimported_exports": include_unimported_exports,
+        "semantics": (
+            "Read-only cleanup plan. Only managed/legacy portable transport artifacts with "
+            "proven successful-import provenance are classified as safe_imported. "
+            "runs/ is never a candidate."
+        ),
+    }
+
+
+def cleanup_execute(lab: Laboratory, include_unimported_exports: bool = False) -> dict[str, Any]:
+    """Delete only artifacts proven safe by a fresh cleanup plan.
+
+    Acts only on artifacts returned by a freshly built plan.  Immediately before
+    every deletion it re-resolves strict containment, reclassifies the artifact
+    from current on-disk state under the same mode, requires it still be
+    deletable, and requires current identity/provenance to agree with the
+    fresh-plan artifact.  If anything changed between plan and deletion, the
+    artifact is skipped and a revalidation failure is reported.  Scientific data
+    in ``runs/`` is never touched.
+    """
+    plan = cleanup_plan(lab, include_unimported_exports=include_unimported_exports)
+    receipts = _discover_import_receipts(lab)
+    deleted: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for artifact in plan["artifacts"]:
+        if not artifact.get("can_delete"):
+            continue
+        path = Path(artifact["path"])
+        roots = (
+            _return_roots(lab) if artifact["kind"] == "returned_archive" else _export_roots(lab)
+        )
+        if not any(_strictly_inside(path, root) for root, _ in roots):
+            failures.append({"kind": artifact["kind"], "path": str(path),
+                             "reason": "containment_revalidation_failed"})
+            continue
+        if not path.exists():
+            failures.append({"kind": artifact["kind"], "path": str(path),
+                             "reason": "already_absent"})
+            continue
+        # Reclassify from current on-disk state under the same mode.
+        if artifact["kind"] == "returned_archive":
+            fresh = _classify_returned_archive(path, lab, receipts)
+        else:
+            fresh = _classify_export(path, lab, receipts, include_unimported=include_unimported_exports)
+        if not fresh.get("can_delete"):
+            failures.append({"kind": artifact["kind"], "path": str(path),
+                             "reason": "revalidation_not_deletable",
+                             "classification": fresh.get("classification")})
+            continue
+        # Require current identity/provenance to agree with the fresh-plan artifact.
+        if (
+            fresh.get("bundle_id") != artifact.get("bundle_id")
+            or fresh.get("campaign_contract_sha256") != artifact.get("campaign_contract_sha256")
+        ):
+            failures.append({"kind": artifact["kind"], "path": str(path),
+                             "reason": "revalidation_identity_changed"})
+            continue
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                failures.append({"kind": artifact["kind"], "path": str(path),
+                                 "reason": "not_file_or_dir"})
+                continue
+            deleted.append({"kind": artifact["kind"], "path": str(path), "bytes": artifact["bytes"]})
+        except OSError as exc:
+            failures.append({"kind": artifact["kind"], "path": str(path), "reason": str(exc)})
+    return {
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "reclaimed_bytes": sum(d["bytes"] for d in deleted),
+        "failures": failures,
+        "failure_count": len(failures),
+        "include_unimported_exports": include_unimported_exports,
+    }
+
+
+def _post_import_cleanup_preview(
+    lab: Laboratory,
+    results_resolved: Path,
+    contract_sha: str,
+    bundle_id: str | None,
+    keep_portable_artifacts: bool,
+) -> dict[str, Any]:
+    """Preview post-import cleanup *candidates* without deleting anything.
+
+    The durable receipt does not exist yet at preview time (it is written after
+    a successful import), so full deletion safety (exact hash proof for the
+    return archive, temporal proof for exports) cannot be established here.
+    Results are therefore reported as **candidates**, not guaranteed deletions.
+    Candidate screening uses the same containment + identity + lock rules as
+    deletion; the receipt-based proof is applied only during actual cleanup.
+    """
+    if keep_portable_artifacts:
+        return {
+            "enabled": False,
+            "reason": "keep_portable_artifacts requested",
+            "managed_return_candidate": False,
+            "matching_export_candidate_count": 0,
+        }
+    archive_root_type: str | None = None
+    for root, rtype in _return_roots(lab):
+        if _strictly_inside(results_resolved, root):
+            archive_root_type = rtype
+            break
+    archive_managed = archive_root_type is not None
+    candidate_exports = 0
+    for root, _rtype in _export_roots(lab):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or not (entry / "bundle_manifest.json").is_file():
+                continue
+            if (entry / ".executor.lock" / "owner.json").is_file():
+                continue
+            try:
+                m = read_json(entry / "bundle_manifest.json")
+            except Exception:
+                continue
+            e_bid = str(m.get("bundle_id") or "")
+            e_contract = str(m.get("campaign_contract_sha256") or "")
+            if not e_bid or not e_contract:
+                continue
+            if e_bid != str(bundle_id or "") or e_contract != str(contract_sha or ""):
+                continue
+            candidate_exports += 1
+    return {
+        "enabled": True,
+        "results_archive_managed": archive_managed,
+        "results_archive_root_type": archive_root_type,
+        "managed_return_candidate": archive_managed,
+        "matching_export_candidate_count": candidate_exports,
+        "note": (
+            "Candidates only; final deletion requires the durable receipt written "
+            "after a successful import to prove exact hash (return archive) and "
+            "temporal (export) safety."
+        ),
+    }
+
+
+def _cleanup_for_import(lab: Laboratory, receipt: dict[str, Any]) -> dict[str, Any]:
+    """Reclaim managed transport artifacts proven safe by a just-written receipt.
+
+    The durable receipt must already be written.  Deletion reclassifies each
+    artifact from current on-disk state immediately before unlink/rmtree and
+    requires the result to remain deletable with identity agreeing with the
+    receipt.  Only the matching returned archive (managed/legacy return root,
+    exact non-empty bundle_id equality and exact hash proof) and matching
+    expanded exports (contract/temporal/lock proof) are deleted.  A cleanup
+    failure does not roll back the already-imported scientific data.
+    """
+    receipts = _discover_import_receipts(lab)
+    receipt_bid = str(receipt.get("bundle_id") or "")
+    receipt_contract = str(receipt.get("campaign_contract_sha256") or "")
+    deleted: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    archive_path = Path(str(receipt.get("results_archive") or "")).expanduser().resolve()
+    if archive_path.is_file():
+        cls = _classify_returned_archive(archive_path, lab, receipts)
+        if (
+            cls["can_delete"]
+            and cls.get("bundle_id") == receipt_bid
+            and (
+                not receipt_contract
+                or cls.get("campaign_contract_sha256") == receipt_contract
+            )
+        ):
+            try:
+                archive_path.unlink()
+                deleted.append({"kind": "returned_archive", "path": str(archive_path),
+                                "bytes": cls["bytes"]})
+            except OSError as exc:
+                failures.append({"kind": "returned_archive", "path": str(archive_path),
+                                 "reason": str(exc)})
+        elif cls["can_delete"]:
+            failures.append({"kind": "returned_archive", "path": str(archive_path),
+                             "reason": "identity_does_not_match_receipt"})
+    for root, _rtype in _export_roots(lab):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or not (entry / "bundle_manifest.json").is_file():
+                continue
+            cls = _classify_export(entry, lab, receipts, include_unimported=False)
+            if not cls["can_delete"]:
+                continue
+            if cls.get("bundle_id") != receipt_bid or cls.get("campaign_contract_sha256") != receipt_contract:
+                continue
+            try:
+                shutil.rmtree(entry)
+                deleted.append({"kind": "expanded_export", "path": str(entry),
+                                "bytes": cls["bytes"]})
+            except OSError as exc:
+                failures.append({"kind": "expanded_export", "path": str(entry),
+                                 "reason": str(exc)})
+    return {
+        "imported": True,
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "reclaimed_bytes": sum(d["bytes"] for d in deleted),
+        "failures": failures,
+        "failure_count": len(failures),
+    }
+
 
 def _has_initial_data_output(case_path: Path) -> bool:
     """Return True when data_output contains at least one file at any depth."""
@@ -437,7 +933,7 @@ def export_plan(cases: Path, lab: Laboratory, output: Path | None = None) -> dic
         f"{DEFAULT_TERMINATION_PROFILE}".encode("utf-8")
     ).hexdigest()[:20]
     if output is None:
-        output = lab.campaign_root / "exports" / f"{cases.parent.name}__{bundle_id}"
+        output = managed_exports_root(lab) / f"{cases.parent.name}__{bundle_id}"
     output = output.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         problems.append({"reason": "output_exists_nonempty", "path": str(output)})
@@ -537,7 +1033,7 @@ def export_bundle(
         f"{DEFAULT_TERMINATION_PROFILE}".encode("utf-8")
     ).hexdigest()[:20]
     if output is None:
-        output = lab.campaign_root / "exports" / f"{cases.parent.name}__{bundle_id}"
+        output = managed_exports_root(lab) / f"{cases.parent.name}__{bundle_id}"
     output = output.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"bundle output already exists and is not empty: {output}")
@@ -687,7 +1183,12 @@ def _safe_zip_members(zf: zipfile.ZipFile) -> None:
             raise ValueError(f"unsafe archive member path: {info.filename}")
 
 
-def import_plan(cases: Path, results: Path, lab: Laboratory) -> dict[str, Any]:
+def import_plan(
+    cases: Path,
+    results: Path,
+    lab: Laboratory,
+    keep_portable_artifacts: bool = False,
+) -> dict[str, Any]:
     cases = cases.expanduser().resolve()
     results = results.expanduser().resolve()
     _, local_rows = load_rows(cases)
@@ -799,6 +1300,10 @@ def import_plan(cases: Path, results: Path, lab: Laboratory) -> dict[str, Any]:
                 if observed != expected:
                     problems.append({"reason": "archived_file_checksum_mismatch", "file": rel})
 
+    post_import_cleanup = _post_import_cleanup_preview(
+        lab, results, local_contract_sha, result_manifest.get("bundle_id"),
+        keep_portable_artifacts,
+    )
     return {
         "can_import": len(problems) == 0,
         "cases_csv": str(cases),
@@ -807,17 +1312,26 @@ def import_plan(cases: Path, results: Path, lab: Laboratory) -> dict[str, Any]:
         "campaign_contract_sha256": local_contract_sha,
         "case_count_in_results": len(cases_to_import),
         "cases": cases_to_import,
+        "keep_portable_artifacts": keep_portable_artifacts,
+        "post_import_cleanup": post_import_cleanup,
         "problems": problems[:50],
         "problem_count": len(problems),
         "semantics": (
             "Import overlays verified returned execution artifacts onto the same local logical cases. "
-            "It does not regenerate cases or change scientific identity."
+            "It does not regenerate cases or change scientific identity. By default managed transport "
+            "artifacts are reclaimed after a successful verified import; keep_portable_artifacts "
+            "suppresses cleanup."
         ),
     }
 
 
-def import_results(cases: Path, results: Path, lab: Laboratory) -> dict[str, Any]:
-    plan = import_plan(cases, results, lab)
+def import_results(
+    cases: Path,
+    results: Path,
+    lab: Laboratory,
+    keep_portable_artifacts: bool = False,
+) -> dict[str, Any]:
+    plan = import_plan(cases, results, lab, keep_portable_artifacts=keep_portable_artifacts)
     if not plan["can_import"]:
         raise ValueError("result import preflight failed; inspect import plan")
     with tempfile.TemporaryDirectory(prefix="nrg-results-import-") as td:
@@ -846,13 +1360,33 @@ def import_results(cases: Path, results: Path, lab: Laboratory) -> dict[str, Any
         "bundle_id": plan.get("bundle_id"),
         "campaign_contract_sha256": plan.get("campaign_contract_sha256"),
         "imported_case_ids": imported,
+        "import_status": "success",
+        "keep_portable_artifacts": keep_portable_artifacts,
     }
     imports_dir = cases.expanduser().resolve().parent / "_imports"
     imports_dir.mkdir(parents=True, exist_ok=True)
     name = datetime.now().strftime("%Y%m%dT%H%M%S") + f"__{plan.get('bundle_id','bundle')}.json"
     record_path = imports_dir / name
+    # The durable receipt must be written successfully before any automatic
+    # transport-artifact deletion begins.  If receipt writing fails, no
+    # portable artifact is deleted.
     write_json(record_path, record)
-    return {**plan, "imported": True, "import_record": str(record_path)}
+    cleanup_result: dict[str, Any] | None = None
+    if not keep_portable_artifacts:
+        try:
+            cleanup_result = _cleanup_for_import(lab, record)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            cleanup_result = {
+                "imported": True,
+                "cleanup_error": f"{type(exc).__name__}: {exc}",
+                "deleted": [],
+                "deleted_count": 0,
+                "reclaimed_bytes": 0,
+                "failures": [{"reason": str(exc)}],
+                "failure_count": 1,
+            }
+    # A cleanup failure does not roll back the already-imported scientific data.
+    return {**plan, "imported": True, "import_record": str(record_path), "cleanup": cleanup_result}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -868,9 +1402,15 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("import-plan")
     s.add_argument("--cases", type=Path, required=True)
     s.add_argument("--results", type=Path, required=True)
+    s.add_argument("--keep-portable-artifacts", action="store_true")
     s = sub.add_parser("import")
     s.add_argument("--cases", type=Path, required=True)
     s.add_argument("--results", type=Path, required=True)
+    s.add_argument("--keep-portable-artifacts", action="store_true")
+    s = sub.add_parser("cleanup-plan")
+    s.add_argument("--include-unimported-exports", action="store_true")
+    s = sub.add_parser("cleanup")
+    s.add_argument("--include-unimported-exports", action="store_true")
     return p
 
 
@@ -885,9 +1425,13 @@ def main() -> int:
     elif args.command == "export":
         payload = export_bundle(args.cases, lab, args.output)
     elif args.command == "import-plan":
-        payload = import_plan(args.cases, args.results, lab)
+        payload = import_plan(args.cases, args.results, lab, keep_portable_artifacts=args.keep_portable_artifacts)
     elif args.command == "import":
-        payload = import_results(args.cases, args.results, lab)
+        payload = import_results(args.cases, args.results, lab, keep_portable_artifacts=args.keep_portable_artifacts)
+    elif args.command == "cleanup-plan":
+        payload = cleanup_plan(lab, include_unimported_exports=args.include_unimported_exports)
+    elif args.command == "cleanup":
+        payload = cleanup_execute(lab, include_unimported_exports=args.include_unimported_exports)
     else:
         raise AssertionError(args.command)
     print(json.dumps(payload, indent=2, sort_keys=True))

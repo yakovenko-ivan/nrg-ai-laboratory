@@ -1132,6 +1132,40 @@ runs/
 
 Execution case paths inside the bundle are relative and portable.
 
+### Default export location and storage contract
+
+The default export destination is a **transient managed root**, not the
+campaign tree:
+
+```text
+<research_root>/.local/portable/exports/<campaign>__<bundle_id>
+```
+
+An explicit `--output` path is always honored and is never rewritten into the
+managed root. The default destination is deterministic; exporting to an existing
+non-empty default destination fails conservatively and never creates a
+suffixed/timestamped duplicate copy.
+
+The durable storage contract is:
+
+```text
+runs/                                  sole durable heavy scientific record
+.local/portable/exports/              transient managed export bundles
+.local/portable/returns/              transient managed returned archives
+campaigns/**/_imports/*.json           durable lightweight import receipts
+```
+
+Legacy laboratory-managed locations are recognized for cleanup only; no new
+artifacts are written there after this change:
+
+```text
+<campaign_root>/exports/
+<research_root>/agent_workspace/portable_returns/
+```
+
+`runs/` is never a cleanup candidate, and no intra-campaign file deduplication,
+hardlinks, reflinks, compression, or content-addressed storage is performed.
+
 ---
 
 ## 27. Configure the compute host
@@ -1272,6 +1306,69 @@ Import verifies:
 - file hashes;
 - returned case inventory;
 - execution provenance.
+
+### Automatic transport-artifact reclamation
+
+After a successful verified import the durable lightweight receipt
+(`campaigns/**/_imports/*.json`) is written **before** any cleanup. By default
+(`keep_portable_artifacts = false`, the production default) the import then
+reclaims the matching managed transport artifacts:
+
+- a returned results archive located under `.local/portable/returns/` (or the
+  legacy `agent_workspace/portable_returns/`) is removed only when the receipt
+  proves exact `bundle_id` equality and exact current SHA-256 agreement;
+- a matching expanded export under `.local/portable/exports/` (or legacy
+  `campaigns/exports/`) is removed only when the receipt proves contract
+  identity, parsed-UTC temporal proof (import at or after export creation),
+  and there is no executor lock.
+
+Deletion safety is provenance-based, never filename-based. A user-provided
+archive outside the managed/legacy return roots is **never** auto-deleted. An
+unproven artifact is retained. A failed import retains everything.
+
+If cleanup itself fails after a scientifically successful import, the
+imported scientific data in `runs/` is **not** rolled back; the durable receipt
+is preserved and the cleanup failure is reported separately.
+
+Use `--keep-portable-artifacts` to suppress automatic cleanup (for debugging or
+forensics):
+
+```bash
+nrg-lab campaign-import-results-execute \
+    --cases campaigns/<generated_campaign>/cases.csv \
+    --results results.zip \
+    --keep-portable-artifacts
+```
+
+### Manual cleanup (core CLI)
+
+Manual reclamation is a plan-then-execute workflow. The planner is read-only;
+the executor acts only on artifacts returned by a fresh plan and revalidates
+containment and provenance before each deletion.
+
+```bash
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup-plan
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup
+```
+
+The default plan classifies only `safe_imported` artifacts (proven by a
+successful import receipt). The advanced `--include-unimported-exports` option
+may additionally classify an abandoned unlocked expanded export with complete
+identity as deletable, but it **never** allows unimported returned archives to
+be deleted (a returned ZIP may contain the only copy of not-yet-imported
+results). There is no force/arbitrary-path option.
+
+```bash
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup-plan --include-unimported-exports
+```
+
+> **Note:** Pi-agent and laboratory-bridge integration for cleanup (a
+> `nrg_campaign_portable_cleanup` tool and `campaign-portable-cleanup-*`
+> bridge commands) is **not yet available**; it is deferred to a separate
+> security-boundary follow-up. Use the core CLI above for manual reclamation.
 
 ---
 
@@ -2236,6 +2333,34 @@ python portable_executor.py pause --mode after-current
 python portable_executor.py stop
 python portable_executor.py pack-results --output results.zip
 ```
+
+## Appendix B2 - Portable bundle command inventory (control plane)
+
+On the control-plane machine, `campaign_tools/portable_bundle.py` manages
+export, import, and transport-artifact cleanup:
+
+```bash
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    export-plan --cases campaigns/<campaign>/cases.csv
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    export --cases campaigns/<campaign>/cases.csv
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    import-plan --cases campaigns/<campaign>/cases.csv --results results.zip
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    import --cases campaigns/<campaign>/cases.csv --results results.zip \
+    --keep-portable-artifacts
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup-plan
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup-plan --include-unimported-exports
+python campaign_tools/portable_bundle.py --laboratory config/laboratory.toml \
+    cleanup
+```
+
+The corresponding `nrg-lab` bridge commands (`campaign-export-bundle-*`,
+`campaign-import-results-*`) wrap export/import. Bridge/Pi cleanup commands are
+deferred to a separate security-boundary follow-up; use the core CLI above for
+manual reclamation.
 
 ---
 
