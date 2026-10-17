@@ -12,6 +12,14 @@ scientific-study workflow needed to conduct CFD/combustion research with NRG.
 
 Current portable-repository release: **v0.7.0**.
 
+## Scientific-first project contract (2026-10-16)
+
+This laboratory prioritizes **concrete scientific tasks and researcher productivity**, not infrastructure for its own sake. The three intended product modes are: **Mode 1**, agent-managed scientific campaigns from interface and build through execution, reference validation and reporting; **Mode 2**, reviewed NRG computing-core candidates tested through automated numerical campaigns; and **Mode 3**, laboratory infrastructure development primarily inside an operator-controlled Xubuntu VirtualBox VM. Mode 1/2 portability to Windows 11/WSL2 is a key requirement.
+
+**Roadmap is not current capability:** the published v0.7.0 laboratory already provides 0D/1D campaign/analysis tools, but does not yet authorize ordinary Pi agents to modify/build NRG source or autonomously develop the computing core. Existing [AGENTS.md](AGENTS.md) permissions remain in force. The first end-to-end target is **TP/HP equilibrium validation against thermochemistry-matched Cantera**.
+
+Read [three modes](docs/scientific-modes.md), [implementation roadmap](docs/scientific-roadmap.md), [first equilibrium mission](docs/mode1-equilibrium-pilot.md), and [installation](docs/installation.md).
+
 ## Architecture
 
 ```text

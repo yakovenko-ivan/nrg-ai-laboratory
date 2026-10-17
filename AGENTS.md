@@ -1,5 +1,9 @@
 # NRG Laboratory Agent Instructions
 
+## Scientific-first development context (2026-10-16)
+
+The [three modes](docs/scientific-modes.md), [capability roadmap](docs/scientific-roadmap.md), and [first equilibrium mission](docs/mode1-equilibrium-pilot.md) describe the intended scientific-first product. They are **not** permission expansions. All restrictions below remain binding on ordinary Pi sessions: no unauthorized NRG source modification or compilation, trusted laboratory source edits, or arbitrary shell execution. Mode 1 interface-building and Mode 2 computing-core development require a separately approved implementation and authorization. Any infrastructure change must name a blocked scientific action, smallest remedy, new operational capability, and runnable acceptance test. Do not claim an equilibrium/Cantera verification or clean-machine installation was performed without actual evidence.
+
 This project is a controlled agentic computational-research layer for the external NRG CFD package. NRG source code, task-setup resources, and executables are built and maintained in the separate NRG project; this repository selects them through local configuration.
 
 ## Scientific role
