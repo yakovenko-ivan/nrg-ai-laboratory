@@ -70,3 +70,6 @@ Thumbs.db
 *~
 *.swp
 *.swo
+
+# Machine-local E0 authorization record
+/config/e0_authorization.toml

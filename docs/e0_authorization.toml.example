@@ -1,0 +1,51 @@
+# E0 Mode 3 protected authorization record -- EXAMPLE / TEMPLATE.
+#
+# This is a TEMPLATE ONLY. The active record is config/e0_authorization.toml,
+# which is intentionally local, ignored by Git, and installed by the operator
+# with mode 0600.
+#
+# Installation:
+#   install -m 600 docs/e0_authorization.toml.example config/e0_authorization.toml
+#   # edit config/e0_authorization.toml and replace every REVIEWER_MUST_FILL_*
+#   # placeholder with researcher-verified values
+#   chmod 600 config/e0_authorization.toml
+#
+# The bridge loads only config/e0_authorization.toml. It fails closed if the
+# record is absent, a symlink, malformed, missing a pin, or inconsistent with
+# the fixed in-code selectors. Git does not preserve Unix mode 0600; the
+# permission must be set explicitly after installation/copy.
+#
+# Authoritative pins must be supplied by the researcher. The currently approved
+# NRG commit is f198fa8ad0085bf995feb0dce06b6f79481db7b4; confirm it before use.
+
+[e0_authorization]
+# Full 40-hex git commit of the approved NRG checkout.
+commit = "REVIEWER_MUST_FILL_APPROVED_NRG_COMMIT"
+
+# 64-hex SHA-256 of the approved equilibrium source file
+# package_interface/src/tests/classic_tests/0D_chemical_equilibrium_validation.f90.
+source_sha256 = "REVIEWER_MUST_FILL_SHA256_OF_0D_chemical_equilibrium_validation.f90"
+
+# 64-hex SHA-256 of the reviewed, post-patch tools/run_validation.py harness.
+harness_sha256 = "REVIEWER_MUST_FILL_SHA256_OF_PATCHED_run_validation.py"
+
+# 64-hex SHA-256 of the approved validation_config.json.
+validation_config_sha256 = "REVIEWER_MUST_FILL_SHA256_OF_validation_config.json"
+
+# These four must equal the fixed in-code constants. Do not edit them here.
+source_relative = "package_interface/src/tests/classic_tests/0D_chemical_equilibrium_validation.f90"
+cmake_selector = "src/tests/classic_tests/0D_chemical_equilibrium_validation.f90"
+cmake_target = "package_interface"
+mechanism_selector = "hydrogen/KEROMNES.txt"
+
+[e0_authorization.acceptance]
+# Exactly these seven researcher-approved keys are required; no extras, no
+# defaults. Each value must be finite, nonnegative, and within the fixed
+# in-code permissible range.
+normalization_tolerance = 1e-6
+nonnegativity_tolerance = 1e-12
+element_conservation_tolerance = 1e-7
+mass_conservation_tolerance = 1e-7
+enthalpy_residual_tolerance = 1e-9
+mole_fraction_tolerance = 5e-4
+temperature_tolerance_K = 2.0
