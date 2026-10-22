@@ -1,0 +1,11 @@
+key,value
+converged,T
+iterations,7
+temperature_K, 2.3876248666734637E+003
+pressure_Pa, 1.0132500000000000E+005
+total_moles, 8.6162190575441389E-001
+max_element_relative_residual, 2.2521984277545927E-015
+mass_relative_residual, 3.3179045140613828E-016
+mole_fraction_sum_residual, 2.2204460492503131E-016
+stationarity_residual, 3.5527136788005009E-015
+enthalpy_relative_residual, 9.6442286465075663E-011
