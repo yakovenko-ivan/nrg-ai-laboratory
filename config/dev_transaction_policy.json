@@ -23,7 +23,8 @@
     ".pi/extensions/nrg-laboratory/index.ts",
     ".pi/extensions/nrg-laboratory/read_only_shell.ts",
     "config/read_only_shell_policy.json",
-    "AGENTS.md"
+    "AGENTS.md",
+    "config/e0_authorization.toml"
   ],
   "self_protection_semantics": "Ordinary nrg_dev_* transactions must not rewrite the guarded-development trusted computing base. Changes to this security boundary require a separate out-of-band security bootstrap (or a future stronger security_boundary transaction class), not an ordinary development transaction.",
   "allowed_test_profiles": [

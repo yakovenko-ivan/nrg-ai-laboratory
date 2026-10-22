@@ -19,6 +19,7 @@ const LAB_CONFIG = process.env.NRG_LABORATORY_CONFIG || join(PROJECT_ROOT, "conf
 const READ_ONLY_SHELL_POLICY = process.env.NRG_READ_ONLY_SHELL_POLICY || join(PROJECT_ROOT, "config", "read_only_shell_policy.json");
 
 const LONG_READ_ONLY_AUDIT_TIMEOUT_MS = 30 * 60_000;
+const E0_TIMEOUT_MS = 30 * 60_000;
 
 type JsonObject = Record<string, any>;
 
@@ -1338,6 +1339,79 @@ export default function (pi: ExtensionAPI) {
       for (const sp of plan.staged_paths ?? []) execArgs.push("--expected-staged-path", sp);
       for (const uc of plan.unexpected_changes ?? []) execArgs.push("--expected-unexpected-change", uc);
       return toolResult(await bridge(execArgs, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_package_interface_build",
+    label: "NRG Package Interface Build",
+    description: "Build the approved NRG 0D chemical-equilibrium package interface into an isolated build root with pinned source selection, a real discovered Fortran compiler, and full source/executable hash provenance. Fail-closed on a dirty checkout; never reuses the researcher's build cache and never invokes install_audit.py. Requires confirmation and a separately authorized Mode 3 environment.",
+    promptSnippet: "Build the source-pinned NRG equilibrium package interface",
+    promptGuidelines: [
+      "Use only with the separately authorized Mode 3 (E0) environment and researcher-approved pinned commit/hashes.",
+      "Fails closed on a dirty or unpinned NRG checkout; never modifies NRG Fortran source and never invokes install_audit.py.",
+      "Builds into an isolated fresh root; no arbitrary shell, executable paths, or CMake flags are accepted.",
+      "Cantera is NOT required for this build and is never queried, hashed, or imported here; a missing Cantera interpreter leaves this build fully usable.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["e0-build-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_build) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "package interface build requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Build the pinned NRG equilibrium package interface?",
+        `Checkout ${plan.commit?.slice(0, 12)}, source ${plan.source_sha256?.slice(0, 12)}, ` +
+        `compiler ${plan.fortran_compiler}, build root ${plan.build_root}. ` +
+        `Isolated; never invokes install_audit.py.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      // Mandatory plan->execute binding (correction 6): the plan must carry the
+      // source/commit identity, else we fail closed rather than building unpinned.
+      if (!plan.source_sha256 || !plan.commit)
+        return toolResult({ error: "build plan missing source/commit identity; refusing to build", plan });
+      const execArgs = ["e0-build-execute", "--expected-source-sha256", plan.source_sha256, "--expected-commit", plan.commit];
+      return toolResult(await bridge(execArgs, signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_equilibrium_validation_run",
+    label: "NRG Equilibrium Validation Run",
+    description: "Invoke the reviewed, versioned validation harness in --mode full (NRG + Cantera) for the pinned KEROMNES mechanism, staged in an isolated short-path scratch task_setup with a fresh output root. Resolves the built executable by recorded hash and computes independent numerical/physical checks separately from the harness screening verdict. Requires Cantera (G3 dependency), confirmation, and a separately authorized Mode 3 environment.",
+    promptSnippet: "Run the source-pinned NRG+Cantera equilibrium full validation",
+    promptGuidelines: [
+      "Use only after nrg_package_interface_build produced a hash-pinned executable and Cantera is provisioned (G3).",
+      "Selector is pinned to hydrogen/KEROMNES.txt; no arbitrary mechanism or executable path is accepted.",
+      "A subprocess return code of zero is not a scientific PASS; the independent acceptance checks are authoritative.",
+      "This command runs the reviewed harness in --mode full, which compares NRG against the OPTIONAL Cantera reference; it therefore still requires Cantera. Do not describe it as an NRG-only validation mode.",
+      "reference_status REFERENCE_NOT_CONFIGURED or CANTERA_UNAVAILABLE is an optional reference-verification status (can_run=false, exit 3), not generic laboratory failure and not a scientific verdict.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["e0-validate-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "equilibrium validation run requires interactive confirmation", plan });
+      const ok = await ctx.ui.confirm(
+        "Run the NRG+Cantera full equilibrium validation?",
+        `Mechanism ${plan.mechanism_selector}, executable ${plan.executable_sha256?.slice(0, 12)}, ` +
+        `harness ${plan.harness_sha256?.slice(0, 12)}. Fresh output root; Cantera required.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      // Mandatory plan->execute binding (correction 6/2/3): identity fields required.
+      if (!plan.executable_sha256 || !plan.harness_sha256 || !plan.validation_config_sha256 || !plan.cantera_python_sha256)
+        return toolResult({ error: "validate plan missing executable/harness/config/interpreter identity; refusing to run", plan });
+      // Bind the interpreter LAUNCHER path (venv identity) and pyvenv.cfg identity,
+      // not only the resolved interpreter binary.
+      if (!plan.cantera_python || plan.cantera_is_venv === undefined)
+        return toolResult({ error: "validate plan missing interpreter launcher/venv identity; refusing to run", plan });
+      const execArgs = ["e0-validate-execute", "--expected-executable-sha256", plan.executable_sha256, "--expected-harness-sha256", plan.harness_sha256, "--expected-validation-config-sha256", plan.validation_config_sha256, "--expected-cantera-python-sha256", plan.cantera_python_sha256];
+      if (plan.cantera_is_venv) {
+        if (!plan.cantera_pyvenv_cfg_sha256)
+          return toolResult({ error: "validate plan reports a venv launcher but no pyvenv.cfg identity; refusing to run", plan });
+        execArgs.push("--expected-cantera-pyvenv-sha256", plan.cantera_pyvenv_cfg_sha256);
+      }
+      execArgs.push("--expected-cantera-python-launcher", plan.cantera_python);
+      return toolResult(await bridge(execArgs, signal, E0_TIMEOUT_MS));
     },
   });
 
