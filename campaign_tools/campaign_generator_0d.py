@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -45,6 +46,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     raise SystemExit("Python 3.11+ is required (tomllib unavailable).") from exc
 
 
+# Legacy six-group contract retained for archived cases, the extension/composite
+# subsystem and callers that still hash the historical full configuration.
 NAMELIST_GROUPS = (
     "case_config",
     "reactor_config",
@@ -52,6 +55,49 @@ NAMELIST_GROUPS = (
     "physics_config",
     "run_control_config",
     "output_config",
+)
+
+# Current NRG 0D interface declares seven namelist groups.  The chemistry group
+# is inserted after physics_config in generated files; Fortran namelist reads
+# are order-independent.
+CHEMISTRY_GROUP = "chemistry_backend_config"
+ALL_NAMELIST_GROUPS = (
+    NAMELIST_GROUPS[:4] + (CHEMISTRY_GROUP,) + NAMELIST_GROUPS[4:]
+)
+
+ALLOWED_CHEMISTRY_BACKENDS = {"slatec", "cvode", "qss1", "qss2"}
+
+CHEMISTRY_GROUP_KEYS: set[str] = {
+    "chemistry_backend",
+    "chemistry_cvode_relative_tolerance",
+    "chemistry_cvode_absolute_tolerance",
+    "chemistry_cvode_max_steps",
+    "chemistry_qss1_relative_change_limit",
+    "chemistry_qss1_minimum_internal_step",
+    "chemistry_qss1_active_concentration_fraction",
+    "chemistry_qss1_step_growth_factor",
+    "chemistry_qss1_max_steps",
+    "chemistry_qss2_error_tolerance",
+    "chemistry_qss2_minimum_internal_step",
+    "chemistry_qss2_active_concentration_fraction",
+    "chemistry_qss2_max_steps",
+}
+
+# Fortran declarations and validation in 0D_ignition_delay_campaign.f90.
+CHEMISTRY_POSITIVE_FLOATS = (
+    "chemistry_cvode_relative_tolerance",
+    "chemistry_cvode_absolute_tolerance",
+    "chemistry_qss1_relative_change_limit",
+    "chemistry_qss1_minimum_internal_step",
+    "chemistry_qss1_active_concentration_fraction",
+    "chemistry_qss2_error_tolerance",
+    "chemistry_qss2_minimum_internal_step",
+    "chemistry_qss2_active_concentration_fraction",
+)
+CHEMISTRY_POSITIVE_INTS = (
+    "chemistry_cvode_max_steps",
+    "chemistry_qss1_max_steps",
+    "chemistry_qss2_max_steps",
 )
 
 GROUP_KEYS: dict[str, set[str]] = {
@@ -96,6 +142,7 @@ GROUP_KEYS: dict[str, set[str]] = {
         "checkpoint_interval_us",
         "save_spatial_fields",
     },
+    CHEMISTRY_GROUP: CHEMISTRY_GROUP_KEYS,
 }
 
 NUMERICAL_VARIANT_KEYS = {
@@ -105,6 +152,7 @@ NUMERICAL_VARIANT_KEYS = {
     "cfl_enabled": ("physics_config", "cfl_enabled"),
     "cfl_coefficient": ("physics_config", "cfl_coefficient"),
     "postprocess_interval_us": ("output_config", "postprocess_interval_us"),
+    "chemistry_backend": (CHEMISTRY_GROUP, "chemistry_backend"),
 }
 
 ALLOWED_SOLVERS = {
@@ -122,30 +170,71 @@ ALLOWED_MECHANISMS = {
 }
 
 MECHANISM_FILES: dict[str, str] = {
-    "keromnes": "KEROMNES.txt",
-    "konnov": "KONNOV.txt",
-    "zhang": "ZHANG.txt",
+    "keromnes": "hydrogen/KEROMNES.txt",
+    "konnov": "hydrogen/KONNOV.txt",
+    "zhang": "hydrogen/ZHANG.txt",
     "gerasimov_shatalov2013": "GERASIMOV_SHATALOV_2013_NRG_noREV.txt",
     "popov2007": "POPOV_2007_H2_O2_NRG.txt",
     "maas_pope1992": "MAAS_POPE_1992_H2_NRG_noREV.txt",
     "li2004": "LI_ZHAO_KAZAKOV_DRYER_2004_checked_N2.txt",
     "williams2004": "WILLIAMS_2004.txt",
     "gri_mech3": "GRI_MECH_3_H2_checked_original.txt",
-    "tereza": "TEREZA_orig.txt",
+    "tereza": "hydrogen/TEREZA.txt",
     "hong2010": "HONG_2010_TABLE7_checked.txt",
 }
+
+# Mirrors resolve_mechanism() in the current 0D interface.  These mechanisms
+# force the thermo/transport filenames below, regardless of the values supplied
+# in /physics_config/.  Provenance must therefore record the forced names.
+FORCED_THERMO_TRANSPORT: dict[str, tuple[str, str]] = {
+    "keromnes": ("KEROMNES_THERMO.txt", "KEROMNES_TRANSDATA.txt"),
+    "konnov": ("KONNOV_THERMO.txt", "KONNOV_TRANSDATA.txt"),
+    "zhang": ("ZHANG_THERMO.txt", "ZHANG_TRANSDATA.txt"),
+    "tereza": ("TEREZA_THERMO.txt", "TEREZA_TRANSDATA.txt"),
+}
+
+# Compiled Fortran defaults for thermo_data_file / transport_data_file.  They
+# apply when a mechanism does not force the names and the campaign omits them.
+FORTRAN_DEFAULT_THERMO = "KEROMNES_THERMO.txt"
+FORTRAN_DEFAULT_TRANSPORT = "KEROMNES_TRANSDATA.txt"
 
 
 def _resolve_task_setup_resource(task_setup: Path, preferred_subdir: str, filename: str) -> Path:
     direct = task_setup / preferred_subdir / filename
     if direct.is_file():
         return direct.resolve()
-    matches = [p.resolve() for p in task_setup.rglob(filename) if p.is_file()]
+    basename = Path(filename).name
+    matches = [p.resolve() for p in task_setup.rglob(basename) if p.is_file()]
     if not matches:
         raise FileNotFoundError(f"task_setup resource not found: {filename}")
     if len(matches) != 1:
         raise ValueError(f"task_setup resource is ambiguous: {filename}: {matches}")
     return matches[0]
+
+
+def effective_thermo_transport(
+    mechanism_id: str, phy: dict[str, Any]
+) -> tuple[str, str, bool]:
+    """Return the thermo/transport files the current interface will consume.
+
+    The current Fortran ``resolve_mechanism`` overwrites supplied filenames for
+    some mechanisms.  Provenance must describe the effective files, not merely
+    what a campaign TOML asked for.  The third value is True when an explicitly
+    supplied name was overridden by the interface.
+    """
+    forced = FORCED_THERMO_TRANSPORT.get(mechanism_id)
+    supplied_thermo = str(phy.get("thermo_data_file", "")).strip()
+    supplied_transport = str(phy.get("transport_data_file", "")).strip()
+    if forced is not None:
+        thermo, transport = forced
+        overridden = bool(
+            (supplied_thermo and supplied_thermo != thermo)
+            or (supplied_transport and supplied_transport != transport)
+        )
+        return thermo, transport, overridden
+    thermo = supplied_thermo or FORTRAN_DEFAULT_THERMO
+    transport = supplied_transport or FORTRAN_DEFAULT_TRANSPORT
+    return thermo, transport, False
 
 
 def task_setup_resource_provenance(cases: list[dict[str, Any]], laboratory: Laboratory) -> dict[str, Any]:
@@ -164,17 +253,32 @@ def task_setup_resource_provenance(cases: list[dict[str, Any]], laboratory: Labo
         path = _resolve_task_setup_resource(task_setup, "chemical_mechanisms", filename)
         kinetic[mechanism_id] = {
             "relative_path": path.relative_to(task_setup).as_posix(),
+            "interface_mechanism_file": filename,
             "sha256": sha256_file(path),
             "size": path.stat().st_size,
         }
 
     thermo_names: set[str] = {"molar_masses.dat"}
+    effective_cases: dict[str, Any] = {}
     for item in cases:
         phy = item["groups"]["physics_config"]
-        for key in ("thermo_data_file", "transport_data_file"):
-            value = str(phy.get(key, "")).strip()
-            if value:
-                thermo_names.add(value)
+        mechanism_id = str(phy["mechanism_id"]).lower()
+        thermo_name, transport_name, overridden = effective_thermo_transport(mechanism_id, phy)
+        thermo_names.add(thermo_name)
+        thermo_names.add(transport_name)
+        cfg = item["groups"].get("case_config", {})
+        case_id = str(item.get("case_id") or cfg.get("case_id") or "")
+        effective_cases[case_id] = {
+            "mechanism_id": mechanism_id,
+            "kinetic_file": kinetic[mechanism_id]["relative_path"],
+            "interface_mechanism_file": kinetic[mechanism_id]["interface_mechanism_file"],
+            "thermo_data_file": thermo_name,
+            "transport_data_file": transport_name,
+            "supplied_thermo_data_file": str(phy.get("thermo_data_file", "")).strip() or None,
+            "supplied_transport_data_file": str(phy.get("transport_data_file", "")).strip() or None,
+            "supplied_thermo_transport_overridden": overridden,
+        }
+
     thermo: dict[str, Any] = {}
     for filename in sorted(thermo_names):
         path = _resolve_task_setup_resource(task_setup, "thermophysical_data", filename)
@@ -188,10 +292,11 @@ def task_setup_resource_provenance(cases: list[dict[str, Any]], laboratory: Labo
         "absolute_resource_root_authoritative": False,
         "kinetic_mechanisms": kinetic,
         "thermophysical_data": thermo,
+        "effective_case_resources": effective_cases,
     }
 
 
-GENERATOR_SCHEMA_VERSION = 3
+GENERATOR_SCHEMA_VERSION = 4
 FINGERPRINT_HEX_LENGTH = 32
 
 TOKEN_ORDER = [
@@ -200,6 +305,7 @@ TOKEN_ORDER = [
     ("mixture_config", "hydrogen_mole_percent"),
     ("physics_config", "mechanism_id"),
     ("physics_config", "solver_id"),
+    (CHEMISTRY_GROUP, "chemistry_backend"),
     ("reactor_config", "cells_number_x"),
     ("reactor_config", "cell_length_x"),
     ("physics_config", "initial_time_step"),
@@ -219,7 +325,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 def validate_group_keys(groups: dict[str, Any], where: str) -> None:
     for group, values in groups.items():
-        if group not in NAMELIST_GROUPS:
+        if group not in ALL_NAMELIST_GROUPS:
             raise ValueError(f"{where}: unsupported namelist group {group!r}")
         if not isinstance(values, dict):
             raise ValueError(f"{where}.{group} must be a TOML table")
@@ -277,7 +383,7 @@ def read_campaign(path: Path) -> dict[str, Any]:
 
 def expand_sweeps(sweep: dict[str, dict[str, Any]]) -> list[dict[str, dict[str, Any]]]:
     axes: list[tuple[str, str, list[Any]]] = []
-    for group in NAMELIST_GROUPS:
+    for group in ALL_NAMELIST_GROUPS:
         for key, values in sweep.get(group, {}).items():
             if not isinstance(values, list) or not values:
                 raise ValueError(f"sweep.{group}.{key} must be a non-empty TOML array")
@@ -318,13 +424,69 @@ def numerical_variants(data: dict[str, Any]) -> list[tuple[str, str, dict[str, d
     return result
 
 
+def _normalize_chemistry_config(chemistry: dict[str, Any]) -> None:
+    backend = chemistry.get("chemistry_backend")
+    if backend is not None:
+        if not isinstance(backend, str):
+            raise TypeError("chemistry_backend must be a string")
+        chemistry["chemistry_backend"] = backend.strip().lower()
+
+
+def _validate_chemistry_config(chemistry: dict[str, Any]) -> None:
+    if not chemistry:
+        return
+    unknown = set(chemistry) - CHEMISTRY_GROUP_KEYS
+    if unknown:
+        raise ValueError(
+            f"{CHEMISTRY_GROUP}: unsupported key(s): {', '.join(sorted(unknown))}"
+        )
+    backend = chemistry.get("chemistry_backend")
+    if backend is not None:
+        if not isinstance(backend, str):
+            raise TypeError("chemistry_backend must be a string")
+        if len(backend) > 24:
+            raise ValueError("chemistry_backend exceeds the Fortran character(24) length")
+        if backend not in ALLOWED_CHEMISTRY_BACKENDS:
+            raise ValueError(
+                "chemistry_backend must be one of: "
+                + ", ".join(sorted(ALLOWED_CHEMISTRY_BACKENDS))
+            )
+    for key in CHEMISTRY_POSITIVE_FLOATS:
+        if key not in chemistry:
+            continue
+        value = chemistry[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{key} must be a real number")
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{key} must be finite and positive")
+    for key in CHEMISTRY_POSITIVE_INTS:
+        if key not in chemistry:
+            continue
+        value = chemistry[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{key} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{key} must be positive")
+    if "chemistry_qss1_step_growth_factor" in chemistry:
+        value = chemistry["chemistry_qss1_step_growth_factor"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("chemistry_qss1_step_growth_factor must be a real number")
+        if not math.isfinite(float(value)) or float(value) < 1.0:
+            raise ValueError("chemistry_qss1_step_growth_factor must be finite and >= 1")
+
+
 def validate_case(groups: dict[str, dict[str, Any]]) -> None:
-    for group in NAMELIST_GROUPS:
+    for group in ALL_NAMELIST_GROUPS:
         if group not in groups:
-            raise ValueError(f"missing namelist group {group}")
+            if group == CHEMISTRY_GROUP:
+                groups[group] = {}
+            else:
+                raise ValueError(f"missing namelist group {group}")
         unknown = set(groups[group]) - GROUP_KEYS[group]
         if unknown:
             raise ValueError(f"{group}: unsupported key(s): {', '.join(sorted(unknown))}")
+
+    _validate_chemistry_config(groups[CHEMISTRY_GROUP])
 
     reactor = groups["reactor_config"]
     mix = groups["mixture_config"]
@@ -379,6 +541,11 @@ def validate_case(groups: dict[str, dict[str, Any]]) -> None:
             
 
 def canonical_scientific_payload(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    # Versioned legacy compatibility: the policy-free full-configuration hash
+    # remains defined over the original six groups only.  The seventh chemistry
+    # group participates in the modern (policy-based) identity and in the
+    # attempt fingerprint, but must not retroactively change archived legacy
+    # fingerprints.
     return {
         group: copy.deepcopy(groups[group])
         for group in NAMELIST_GROUPS
@@ -435,7 +602,7 @@ def solver_token(value: str) -> str:
 def varying_fields(cases: list[dict[str, Any]]) -> set[tuple[str, str]]:
     values: dict[tuple[str, str], set[str]] = {}
     for item in cases:
-        for group in NAMELIST_GROUPS:
+        for group in ALL_NAMELIST_GROUPS:
             if group == "case_config":
                 continue
             for key, value in item["groups"][group].items():
@@ -454,6 +621,8 @@ def directory_token(group: str, key: str, value: Any) -> str:
         return str(value).upper()
     if (group, key) == ("physics_config", "solver_id"):
         return solver_token(str(value))
+    if (group, key) == (CHEMISTRY_GROUP, "chemistry_backend"):
+        return f"CH_{sanitize_token(str(value).upper())}"
     if (group, key) == ("reactor_config", "cells_number_x"):
         return f"N{int(value)}"
     if (group, key) == ("reactor_config", "cell_length_x"):
@@ -470,13 +639,15 @@ def make_label(item: dict[str, Any]) -> str:
     r = g["reactor_config"]
     m = g["mixture_config"]
     p = g["physics_config"]
+    backend = g.get(CHEMISTRY_GROUP, {}).get("chemistry_backend", "default")
     return (
         f"0D CV H2-air | T0={float(m['initial_temperature']):g} K, "
         f"p0={float(m['initial_pressure'])/101325.0:.3g} atm, "
         f"H2={float(m['hydrogen_mole_percent']):g} mol.% | "
         f"{str(p['mechanism_id']).upper()} | {solver_token(str(p['solver_id']))} | "
         f"N={int(r['cells_number_x'])}, dx={float(r['cell_length_x']):.3e} m, "
-        f"dt0={float(p['initial_time_step']):.3e} s | {item['numerical_variant']}"
+        f"dt0={float(p['initial_time_step']):.3e} s | "
+        f"backend={backend} | {item['numerical_variant']}"
     )
 
 
@@ -521,6 +692,8 @@ def expand_campaign(data: dict[str, Any], laboratory: Laboratory) -> list[dict[s
     for sweep_override, (variant_name, variant_desc, variant_override) in itertools.product(sweeps, variants):
         groups = deep_merge(defaults, sweep_override)
         groups = deep_merge(groups, variant_override)
+        groups.setdefault(CHEMISTRY_GROUP, {})
+        _normalize_chemistry_config(groups[CHEMISTRY_GROUP])
         groups.setdefault("case_config", {})["numerical_variant"] = variant_name
         validate_case({**groups, "case_config": groups["case_config"]})
         raw.append({
@@ -608,9 +781,9 @@ def render_namelist(groups: dict[str, dict[str, Any]]) -> str:
         "! Agentic homogeneous constant-volume reactor campaign.",
         "",
     ]
-    for group in NAMELIST_GROUPS:
+    for group in ALL_NAMELIST_GROUPS:
         lines.append(f"&{group}")
-        for key, value in groups[group].items():
+        for key, value in groups.get(group, {}).items():
             lines.append(f"    {key} = {fortran_value(value)}")
         lines.append("/")
         lines.append("")
@@ -642,8 +815,8 @@ def flatten_case(item: dict[str, Any]) -> dict[str, Any]:
         "data_output_path": data_output_relpath.as_posix(),
         "numerical_variant": item["numerical_variant"],
     }
-    for group in NAMELIST_GROUPS:
-        for key, value in item["groups"][group].items():
+    for group in ALL_NAMELIST_GROUPS:
+        for key, value in item["groups"].get(group, {}).items():
             row[f"{group}.{key}"] = value
     return row
 

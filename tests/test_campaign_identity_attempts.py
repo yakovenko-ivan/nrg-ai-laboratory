@@ -56,6 +56,13 @@ def make_lab(root: Path) -> Laboratory:
     (chemistry / "KEROMNES.txt").write_text("synthetic KEROMNES mechanism\n", encoding="utf-8")
     (chemistry / "ZHANG.txt").write_text("synthetic ZHANG mechanism\n", encoding="utf-8")
     (thermo / "molar_masses.dat").write_text("synthetic molar masses\n", encoding="utf-8")
+    for mechanism in ("KEROMNES", "KONNOV", "ZHANG"):
+        (thermo / f"{mechanism}_THERMO.txt").write_text(
+            f"synthetic {mechanism} thermo\n", encoding="utf-8"
+        )
+        (thermo / f"{mechanism}_TRANSDATA.txt").write_text(
+            f"synthetic {mechanism} transport\n", encoding="utf-8"
+        )
 
     computing = root / "bin" / "computing_module"
     computing.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")

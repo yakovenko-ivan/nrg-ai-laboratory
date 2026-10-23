@@ -25,6 +25,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError("Python 3.11+ is required") from exc
 
 
+# Chemistry backend controls are deliberately absent.  They define the chemical
+# ODE integration configuration and must be an explicit identity axis or a new
+# case, not a free attempt override.
 DEFAULT_ATTEMPT_TUNABLE_FIELDS = (
     "physics_config.initial_time_step",
     "physics_config.cfl_enabled",
@@ -40,6 +43,7 @@ NUMERICAL_VARIANT_FIELD_MAP = {
     "cfl_enabled": "physics_config.cfl_enabled",
     "cfl_coefficient": "physics_config.cfl_coefficient",
     "postprocess_interval_us": "output_config.postprocess_interval_us",
+    "chemistry_backend": "chemistry_backend_config.chemistry_backend",
 }
 
 NON_CASE_GROUPS = (
@@ -48,6 +52,7 @@ NON_CASE_GROUPS = (
     "mixture_config",
     "ignition_config",
     "physics_config",
+    "chemistry_backend_config",
     "run_control_config",
     "output_config",
 )
