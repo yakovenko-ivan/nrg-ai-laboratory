@@ -21,6 +21,87 @@ const READ_ONLY_SHELL_POLICY = process.env.NRG_READ_ONLY_SHELL_POLICY || join(PR
 const LONG_READ_ONLY_AUDIT_TIMEOUT_MS = 30 * 60_000;
 const E0_TIMEOUT_MS = 30 * 60_000;
 
+
+const DEV_GRANT_TTL_MS = 8 * 60 * 60_000;
+
+type DevStandingGrant = {
+  transactionId: string;
+  sessionId: string;
+  allowedPaths: string[];
+  expiresAt: number;
+};
+
+const devStandingGrants = new Map<string, DevStandingGrant>();
+
+function devGrantKey(sessionId: string, transactionId: string): string {
+  return `${sessionId}\u0000${transactionId}`;
+}
+
+function devSessionId(ctx: { sessionManager?: { getSessionId?: () => string } }): string | null {
+  try {
+    const id = ctx.sessionManager?.getSessionId?.();
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearDevStandingGrants(): void {
+  devStandingGrants.clear();
+}
+
+function grantDevStanding(
+  ctx: { sessionManager?: { getSessionId?: () => string } },
+  plan: { transaction_id: string; allowed_paths: string[] },
+): boolean {
+  const sessionId = devSessionId(ctx);
+  if (!sessionId) return false;
+  devStandingGrants.set(devGrantKey(sessionId, plan.transaction_id), {
+    transactionId: plan.transaction_id,
+    sessionId,
+    allowedPaths: [...plan.allowed_paths],
+    expiresAt: Date.now() + DEV_GRANT_TTL_MS,
+  });
+  return true;
+}
+
+function requireDevStanding(
+  ctx: { sessionManager?: { getSessionId?: () => string } },
+  transactionId: string,
+): { ok: true; grant: DevStandingGrant } | { ok: false; error: string } {
+  const sessionId = devSessionId(ctx);
+  if (!sessionId) {
+    return {
+      ok: false,
+      error: "Mode 3 standing authorization unavailable: cannot verify originating session identity.",
+    };
+  }
+  const key = devGrantKey(sessionId, transactionId);
+  const grant = devStandingGrants.get(key);
+  if (!grant) {
+    return {
+      ok: false,
+      error: "Mode 3 standing authorization missing: start the transaction interactively in this session first.",
+    };
+  }
+  if (grant.transactionId !== transactionId || Date.now() >= grant.expiresAt) {
+    devStandingGrants.delete(key);
+    return {
+      ok: false,
+      error: "Mode 3 standing authorization expired or mismatched; start a new transaction.",
+    };
+  }
+  return { ok: true, grant };
+}
+
+function revokeDevStanding(
+  ctx: { sessionManager?: { getSessionId?: () => string } },
+  transactionId: string,
+): void {
+  const sessionId = devSessionId(ctx);
+  if (sessionId) devStandingGrants.delete(devGrantKey(sessionId, transactionId));
+}
+
 type JsonObject = Record<string, any>;
 
 type LabState = {
@@ -1042,17 +1123,34 @@ export default function (pi: ExtensionAPI) {
       const plan = await bridge(planArgs, signal);
       if (plan.error || !plan.can_start) return toolResult(plan);
       if (!ctx.hasUI) return toolResult({ error: "dev transaction start requires interactive confirmation", plan });
+      const profiles = Array.isArray(plan.allowed_test_profiles)
+        ? plan.allowed_test_profiles.join(", ")
+        : "none";
+      const timeout = plan.test_timeout_seconds ?? 1800;
       const ok = await ctx.ui.confirm(
         "Start guarded development transaction?",
         `Create isolated worktree ${plan.worktree} on branch ${plan.development_branch} from ${plan.baseline_sha?.slice(0, 12)}. ` +
-        `Allowed paths: ${plan.allowed_paths.join(", ")}. The main checkout is not modified.`,
+        `Allowed paths: ${plan.allowed_paths.join(", ")}. The main checkout is not modified. ` +
+        `Named test profiles: ${profiles}. Test timeout: ${timeout}s. ` +
+        `Named tests execute agent-authored candidate Python as the local user; this is not an OS sandbox. ` +
+        `This authorizes candidate writes/edits and named tests in this session until commit/discard or ${Math.round(DEV_GRANT_TTL_MS / 3_600_000)}h.`,
       );
       if (!ok) return toolResult({ cancelled: true, plan });
       const execArgs = ["dev-transaction-start", "--transaction-id", plan.transaction_id,
                         "--task", params.task, "--rationale", params.rationale,
                         "--baseline-sha", plan.baseline_sha];
       for (const p of plan.allowed_paths) execArgs.push("--allowed-path", p);
-      return toolResult(await bridge(execArgs, signal));
+      // One interactive start creates a process-local, session-bound, expiring grant.
+      const result = await bridge(execArgs, signal);
+      if (result.started && !result.error) {
+        if (!grantDevStanding(ctx, plan)) {
+          return toolResult({
+            ...result,
+            warning: "transaction started, but no standing grant could be created: session identity unavailable",
+          });
+        }
+      }
+      return toolResult(result);
     },
   });
 
@@ -1126,7 +1224,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "nrg_dev_write",
     label: "NRG Dev Write",
-    description: "Create or replace one allowlisted UTF-8 text file in the isolated development worktree. The trusted engine validates transaction/path/TCB policy, binds execution to semantic-spec SHA + HEAD + branch + candidate tree + target content, stages the result, and generates/persists the canonical Git patch. Requires confirmation.",
+    description: "Create or replace one allowlisted UTF-8 text file in the isolated development worktree. The trusted engine validates transaction/path/TCB policy, binds execution to semantic-spec SHA + HEAD + branch + candidate tree + target content, stages the result, and generates/persists the canonical Git patch. Requires an active session-bound standing grant from transaction start; commit/discard remain separately confirmed.",
     promptSnippet: "Create or replace an allowlisted text file in a guarded development transaction",
     promptGuidelines: [
       "Prefer this semantic tool over hand-authoring a unified diff for ordinary text-file creation or whole-file replacement.",
@@ -1141,20 +1239,13 @@ export default function (pi: ExtensionAPI) {
       content: Type.String({ description: "Complete UTF-8 text content" }),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
+      const standing = requireDevStanding(ctx, params.transaction_id);
+      if (!standing.ok) return toolResult({ error: standing.error });
       const plan = await bridge([
         "dev-write-plan", "--transaction-id", params.transaction_id,
         "--path", params.path, "--mode", params.mode, `--content=${params.content}`,
       ], signal);
       if (plan.error || !plan.can_write) return toolResult(plan);
-      if (!ctx.hasUI) return toolResult({ error: "dev semantic write requires interactive confirmation", plan });
-      const preview = (plan.preview_diff ?? "").slice(0, 2000);
-      const ok = await ctx.ui.confirm(
-        "Apply semantic write to development worktree?",
-        `${plan.mode} ${plan.path} (${plan.content_bytes} bytes). ` +
-        `Spec ${plan.semantic_spec_sha256.slice(0, 12)}, candidate tree ${plan.applied_against_tree_sha.slice(0, 12)}.` +
-        (preview ? `\n\nPreview:\n${preview}` : ""),
-      );
-      if (!ok) return toolResult({ cancelled: true, plan });
       const args = [
         "dev-write-execute", "--transaction-id", params.transaction_id,
         "--path", params.path, "--mode", params.mode, `--content=${params.content}`,
@@ -1171,7 +1262,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "nrg_dev_edit",
     label: "NRG Dev Edit",
-    description: "Perform one exact bounded old_text→new_text replacement in an allowlisted UTF-8 text file inside the isolated development worktree. The plan verifies the exact occurrence count; execute is bound to semantic-spec SHA + HEAD + branch + candidate tree + target content. The trusted engine stages the result and generates/persists the canonical Git patch. Requires confirmation.",
+    description: "Perform one exact bounded old_text→new_text replacement in an allowlisted UTF-8 text file inside the isolated development worktree. The plan verifies the exact occurrence count; execute is bound to semantic-spec SHA + HEAD + branch + candidate tree + target content. The trusted engine stages the result and generates/persists the canonical Git patch. Requires an active session-bound standing grant from transaction start; commit/discard remain separately confirmed.",
     promptSnippet: "Apply an exact text replacement in a guarded development transaction",
     promptGuidelines: [
       "Prefer this semantic tool over hand-authored diff hunks for bounded textual edits.",
@@ -1187,21 +1278,14 @@ export default function (pi: ExtensionAPI) {
       expected_occurrences: Type.Number({ minimum: 1, description: "Exact number of old_text occurrences required" }),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
+      const standing = requireDevStanding(ctx, params.transaction_id);
+      if (!standing.ok) return toolResult({ error: standing.error });
       const plan = await bridge([
         "dev-edit-plan", "--transaction-id", params.transaction_id,
         "--path", params.path, `--old-text=${params.old_text}`, `--new-text=${params.new_text}`,
         "--expected-occurrences", String(params.expected_occurrences),
       ], signal);
       if (plan.error || !plan.can_edit) return toolResult(plan);
-      if (!ctx.hasUI) return toolResult({ error: "dev semantic edit requires interactive confirmation", plan });
-      const preview = (plan.preview_diff ?? "").slice(0, 2000);
-      const ok = await ctx.ui.confirm(
-        "Apply semantic edit to development worktree?",
-        `Edit ${plan.path}: ${plan.actual_occurrences} confirmed occurrence(s). ` +
-        `Spec ${plan.semantic_spec_sha256.slice(0, 12)}, candidate tree ${plan.applied_against_tree_sha.slice(0, 12)}.` +
-        (preview ? `\n\nPreview:\n${preview}` : ""),
-      );
-      if (!ok) return toolResult({ cancelled: true, plan });
       const args = [
         "dev-edit-execute", "--transaction-id", params.transaction_id,
         "--path", params.path, `--old-text=${params.old_text}`, `--new-text=${params.new_text}`,
@@ -1233,14 +1317,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "nrg_dev_test",
     label: "NRG Dev Test",
-    description: "Run a named trusted test profile (diff_check, targeted_pytest, full_pytest, lab_doctor, lab_config_validate) in the isolated worktree. Execute is bound to the confirmed candidate_tree_sha, head, and branch; a changed candidate or stale HEAD is rejected. Refuses if unexpected working-tree changes exist (working tree must match candidate index). Fixed normalized commands only; no shell; NOT an OS sandbox. Requires confirmation.",
+    description: "Run a named trusted test profile (diff_check, targeted_pytest, full_pytest, lab_doctor, lab_config_validate) in the isolated worktree. Execute is bound to the confirmed candidate_tree_sha, head, and branch; a changed candidate or stale HEAD is rejected. Refuses if unexpected working-tree changes exist (working tree must match candidate index). Fixed normalized commands only; no shell; NOT an OS sandbox. Requires an active session-bound standing grant from transaction start; commit/discard remain separately confirmed.",
     promptSnippet: "Run a trusted test profile in the isolated development worktree",
     promptGuidelines: [
       "Only named profiles from config/dev_transaction_policy.json are accepted.",
       "targeted_pytest accepts exact repository-relative tests/*.py paths, optionally with one ::test_name node selector; no -k/keyword expressions.",
       "Test results are bound to the exact candidate_tree_sha; a candidate state change during the test yields integrity_failed and is not bound as validation.",
       "Pre-existing unexpected working-tree changes block test execution because pytest runs from the working tree, not the index.",
-      "Candidate Python runs with the local user's permissions; human confirmation is a real trust boundary.",
+      "Candidate Python runs with the local user's permissions; the transaction-start standing grant is the trust boundary for named test profiles, while commit/discard remain separately confirmed.",
     ],
     parameters: Type.Object({
       transaction_id: Type.String(),
@@ -1249,19 +1333,13 @@ export default function (pi: ExtensionAPI) {
       require_nrg: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
+      const standing = requireDevStanding(ctx, params.transaction_id);
+      if (!standing.ok) return toolResult({ error: standing.error });
       const planArgs = ["dev-test-plan", "--transaction-id", params.transaction_id, "--profile", params.profile];
       for (const tf of params.test_files ?? []) planArgs.push("--test-file", tf);
       if (params.require_nrg) planArgs.push("--require-nrg");
       const plan = await bridge(planArgs, signal);
       if (plan.error || !plan.can_run) return toolResult(plan);
-      if (!ctx.hasUI) return toolResult({ error: "dev test execution requires interactive confirmation", plan });
-      const ok = await ctx.ui.confirm(
-        "Run development test profile?",
-        `Profile ${params.profile}. Command: ${plan.normalized_command.join(" ")}. ` +
-        `Candidate tree ${plan.candidate_tree_sha?.slice(0, 12)}. HEAD ${plan.current_head_sha?.slice(0, 12)}. ` +
-        `This executes candidate Python with local-user permissions.`,
-      );
-      if (!ok) return toolResult({ cancelled: true, plan });
       const execArgs = ["dev-test-execute", "--transaction-id", params.transaction_id, "--profile", params.profile,
                         "--expected-candidate-tree-sha", plan.candidate_tree_sha,
                         "--expected-head-sha", plan.current_head_sha,
@@ -1305,7 +1383,9 @@ export default function (pi: ExtensionAPI) {
                         "--expected-candidate-tree-sha", plan.candidate_tree_sha,
                         "--expected-head-sha", plan.current_head_sha,
                         "--expected-branch", plan.current_branch];
-      return toolResult(await bridge(execArgs, signal));
+      const result = await bridge(execArgs, signal);
+      if (!result.error) revokeDevStanding(ctx, params.transaction_id);
+      return toolResult(result);
     },
   });
 
@@ -1338,7 +1418,9 @@ export default function (pi: ExtensionAPI) {
       if (plan.current_branch) execArgs.push("--expected-branch", plan.current_branch);
       for (const sp of plan.staged_paths ?? []) execArgs.push("--expected-staged-path", sp);
       for (const uc of plan.unexpected_changes ?? []) execArgs.push("--expected-unexpected-change", uc);
-      return toolResult(await bridge(execArgs, signal));
+      const result = await bridge(execArgs, signal);
+      if (!result.error) revokeDevStanding(ctx, params.transaction_id);
+      return toolResult(result);
     },
   });
 
@@ -1450,6 +1532,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    clearDevStandingGrants();
     const state = await ensureLab(ctx.signal);
     if (!state) {
       ctx.ui.notify(`NRG laboratory extension could not load ${LAB_CONFIG}`, "error");
@@ -1485,6 +1568,10 @@ export default function (pi: ExtensionAPI) {
     } else {
       ctx.ui.setStatus("nrg-lab", missingNrgTools.length > 0 ? "NRG lab · tools incomplete · RO shell" : "NRG lab · RO shell");
     }
+  });
+
+  pi.on("session_shutdown", async () => {
+    clearDevStandingGrants();
   });
 
   pi.on("tool_call", async (event, ctx) => {
