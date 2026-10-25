@@ -28,6 +28,22 @@ v1 stops at a committed development branch. The agent must **not** merge into `m
 For ordinary UTF-8 source changes, prefer the semantic `nrg_dev_write` (create/replace) and `nrg_dev_edit` (exact bounded replacement) tools. The trusted transaction engine performs the worktree mutation, stages it, and generates/persists the canonical Git patch artifact; the agent should not hand-author or hash unified diffs for routine edits. `nrg_dev_apply_patch` remains available as the advanced path for an already reviewed external patch artifact under the configured studies workspace. There is no direct edit-to-production path.
 
 During an active development transaction, transaction metadata returned by `nrg_dev_*` tools (baseline SHA, current HEAD, branch, worktree, candidate-tree SHA, staged paths) is authoritative. Do not rediscover the same state through shell Git unless a guarded tool explicitly lacks the information required for the task.
+
+### Source-code formatting and patch hygiene
+
+These requirements apply to all agent-generated source-code changes.
+
+- Generate UTF-8 text with LF (`\n`) line endings and exactly one final newline.
+- Never add trailing spaces or tabs, including on otherwise blank lines.
+- Preserve existing formatting where it is semantically significant. Do not automatically reformat scientific datasets, fixed-form Fortran, or unrelated files.
+- Prefer `nrg_dev_write` and `nrg_dev_edit` for ordinary authorized source changes. Let the trusted transaction engine generate canonical Git patches; do not manually calculate unified-diff hunk headers.
+- Before requesting implementation approval, run the authorized `diff_check` profile against the current staged candidate tree.
+- If formatting validation fails, correct the source through an authorized edit, then regenerate and revalidate the candidate.
+- After any correction, rerun the checks required for the resulting candidate state. Previous validation results are not evidence for a different tree.
+- Report Git revision, changed-file inventory, formatting-check results, test results, and any unresolved validation blockers.
+- Do not bypass the read-only shell restrictions, guarded development policy, or self-protected TCB to correct formatting problems.
+- For operator-controlled TCB patches, explicitly request operator execution of `git apply --check` and `git diff --check`; never claim these checks passed unless their results were observed.
+
 ## Read-only shell inspection
 
 - A restricted Pi `bash` tool may be used for read-only filesystem, text, disk-usage, checksum, and repository inspection when the needed information is not already exposed more directly by an `nrg_*` tool or Pi's built-in read/search tools.
