@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 import re
 import shutil
+import tomllib
 
 from nrg_analysis.laboratory import Laboratory
+from nrg_analysis.provenance import sha256_file
 
 
 def slugify(value: str) -> str:
@@ -18,6 +20,57 @@ def slugify(value: str) -> str:
     if not value:
         raise ValueError("empty study slug")
     return value
+
+
+_STUDY_NAME_LINE = re.compile(r'^(\s*name\s*=\s*)"[^"]*"(.*)$')
+
+
+def _set_study_name(config_path: Path, slug: str) -> None:
+    """Set ``[study].name`` to the newly created study slug.
+
+    The controlled template ships ``name = "template"``.  A generated study must
+    identify itself, so only that single value is rewritten; every other key,
+    value, comment, and type is preserved, and the result is re-parsed to prove
+    that nothing else changed.
+    """
+
+    if not config_path.is_file():
+        raise SystemExit(
+            f"controlled study template has no analysis_config.toml: {config_path}"
+        )
+    text = config_path.read_text(encoding="utf-8")
+    before = tomllib.loads(text)
+    if not isinstance(before.get("study"), dict) or "name" not in before["study"]:
+        raise SystemExit(f"controlled template has no [study].name: {config_path}")
+
+    lines: list[str] = []
+    in_study = False
+    replaced = False
+    for raw in text.splitlines(keepends=True):
+        newline = "\n" if raw.endswith("\n") else ""
+        body = raw[: -len(newline)] if newline else raw
+        stripped = body.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_study = stripped == "[study]"
+        elif in_study and not replaced:
+            match = _STUDY_NAME_LINE.match(body)
+            if match:
+                body = f'{match.group(1)}"{slug}"{match.group(2)}'
+                replaced = True
+        lines.append(body + newline)
+    if not replaced:
+        raise SystemExit(
+            f"controlled template [study] section has no name key: {config_path}"
+        )
+
+    updated = "".join(lines)
+    expected = tomllib.loads(text)
+    expected["study"]["name"] = slug
+    if tomllib.loads(updated) != expected:
+        raise SystemExit(
+            "study name update would change unrelated analysis_config fields"
+        )
+    config_path.write_text(updated, encoding="utf-8")
 
 
 def main() -> int:
@@ -36,7 +89,9 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="replace an existing study directory")
     args = parser.parse_args()
 
-    lab = Laboratory.load(args.laboratory)
+    # Study authoring is repository-only work: it reads the laboratory paths and
+    # writes study metadata, and never needs the external NRG executables.
+    lab = Laboratory.load(args.laboratory, require_runtime=False)
     lab.ensure_output_roots()
 
     module_root = Path(__file__).resolve().parent
@@ -50,6 +105,7 @@ def main() -> int:
             raise SystemExit(f"study already exists: {destination}")
         shutil.rmtree(destination)
     shutil.copytree(template, destination)
+    _set_study_name(destination / "analysis_config.toml", destination.name)
 
     cases = Path(args.cases).expanduser().resolve()
     if not cases.is_file():
@@ -69,6 +125,9 @@ def main() -> int:
         "laboratory_local_config": (str(lab.local_config_path) if lab.local_config_path else None),
         "cases_csv": str(cases),
         "case_root": str(case_root),
+        "cases_csv_sha256": sha256_file(cases),
+        "analysis_script_sha256": sha256_file(destination / "analyze.py"),
+        "analysis_config_sha256": sha256_file(destination / "analysis_config.toml"),
         "status": "draft",
     }
     (destination / "study_manifest.json").write_text(

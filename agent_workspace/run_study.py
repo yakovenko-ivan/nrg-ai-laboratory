@@ -74,19 +74,66 @@ def changed_raw_files(
     return changed
 
 
-def _runtime_provenance(lab: Laboratory) -> dict[str, Any]:
-    runtime: dict[str, Any] = {
-        "computing_module": {
-            "path": str(lab.computing_module),
-            "sha256": sha256_file(lab.computing_module),
-        },
-        "package_interfaces": {},
+def _component_provenance(path: Path) -> dict[str, Any]:
+    """Provenance for one runtime component without fabricating a hash.
+
+    A missing, non-executable, or unreadable component is recorded explicitly
+    with ``sha256 = None``; it is never confused with a verified binary.
+    """
+
+    exists = path.is_file()
+    executable = bool(exists and (os.name == "nt" or os.access(path, os.X_OK)))
+    digest: str | None = None
+    read_error: str | None = None
+    if exists:
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "path": str(path),
+        "exists": bool(exists),
+        "executable": executable,
+        "readable": digest is not None,
+        "sha256": digest,
+        "read_error": read_error,
     }
-    for name, path in lab.package_interfaces.items():
-        runtime["package_interfaces"][name] = {
-            "path": str(path),
-            "sha256": sha256_file(path),
-        }
+
+
+def _runtime_provenance(lab: Laboratory) -> dict[str, Any]:
+    computing_module = _component_provenance(lab.computing_module)
+    package_interfaces = {
+        name: _component_provenance(path)
+        for name, path in sorted(lab.package_interfaces.items())
+    }
+    computing_ready = bool(
+        computing_module["executable"] and computing_module["readable"]
+    )
+    preparation_ready = {
+        name: bool(component["executable"] and component["readable"])
+        for name, component in package_interfaces.items()
+    }
+    unavailable = [] if computing_ready else ["computing_module"]
+    unavailable += [
+        f"package_interface_{name}"
+        for name, ready in preparation_ready.items()
+        if not ready
+    ]
+    runtime: dict[str, Any] = {
+        # Legacy-compatible per-component keys are retained; hashes are null when
+        # the component is absent or unreadable.
+        "computing_module": computing_module,
+        "package_interfaces": package_interfaces,
+        "runtime_available": computing_ready,
+        "execution_ready": computing_ready,
+        "preparation_ready": preparation_ready,
+        "unavailable": unavailable,
+        "provenance_note": (
+            "This is the runtime present at analysis time.  Components recorded "
+            "with sha256=null were unavailable and are not evidence of the runtime "
+            "that originally produced archived case results."
+        ),
+    }
     if lab.runtime_manifest.is_file():
         runtime["runtime_manifest"] = {
             "path": str(lab.runtime_manifest),
@@ -288,7 +335,9 @@ def main() -> int:
 
     manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
     lab_path = args.laboratory or manifest.get("laboratory_config")
-    lab = Laboratory.load(lab_path)
+    # Offline/synthetic analysis reads existing data and must not require the
+    # external NRG executables.  Runtime readiness is recorded as provenance.
+    lab = Laboratory.load(lab_path, require_runtime=False)
 
     studies_root = lab.studies_root.resolve()
     try:
