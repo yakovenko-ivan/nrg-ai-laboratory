@@ -42,6 +42,12 @@ class PhysicalCampaignResumeRegressionTests(unittest.TestCase):
             runnable_ids = [f"R{i:06d}" for i in range(2, 721)]
 
             ns = {
+                # This AST-isolated test exercises campaign-wide case selection with an
+                # available runtime.  The production physical_launch_plan() also calls
+                # _execution_runtime_error(); absent-runtime rejection and fail-closed
+                # behaviour are verified independently by the P1A bridge tests, so the
+                # helper is stubbed here for this selection test only.
+                "_execution_runtime_error": lambda lab: None,
                 "Path": Path,
                 "Laboratory": object,
                 "Any": object,

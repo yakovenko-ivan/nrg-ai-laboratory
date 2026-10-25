@@ -744,10 +744,137 @@ def cmd_study_list(args: argparse.Namespace, lab: Laboratory) -> int:
             records.append(record)
     return emit({"studies_root": str(root), "count": len(records), "studies": records})
 
+def _component_state(path: Path) -> dict[str, Any]:
+    exists = path.is_file()
+    executable = bool(exists and (os.name == "nt" or os.access(path, os.X_OK)))
+    digest: str | None = None
+    read_error: str | None = None
+    if exists:
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "path": str(path),
+        "exists": bool(exists),
+        "executable": executable,
+        "readable": digest is not None,
+        "sha256": digest,
+        "read_error": read_error,
+    }
+
+
+def _component_ready(component: dict[str, Any]) -> bool:
+    # Ready means present, executable, and hashable.  A file that exists and is
+    # executable but cannot be read has no verified provenance and must not be
+    # reported as a usable runtime component.
+    return bool(component.get("executable") and component.get("readable"))
+
+
+def _execution_runtime_error(lab: Laboratory) -> dict[str, Any] | None:
+    try:
+        lab.validate_execution_runtime()
+        if not _component_ready(_component_state(lab.computing_module)):
+            raise PermissionError(
+                "computing_module exists and is executable but cannot be read for "
+                f"provenance hashing: {lab.computing_module}"
+            )
+    except Exception as exc:
+        return {
+            "error": f"execution runtime unavailable: {type(exc).__name__}: {exc}",
+            "runtime_ready": False,
+        }
+    return None
+
+
+def _preparation_runtime_error(
+    lab: Laboratory, interface: Path
+) -> dict[str, Any] | None:
+    try:
+        if lab.task_setup_template.name != "task_setup":
+            raise ValueError(
+                "task_setup_template must point to a directory named 'task_setup'"
+            )
+        if not lab.task_setup_template.is_dir():
+            raise FileNotFoundError(
+                f"task_setup_template not found: {lab.task_setup_template}"
+            )
+        state = _component_state(interface)
+        if not state["exists"]:
+            raise FileNotFoundError(f"package_interface not found: {interface}")
+        if not state["executable"]:
+            raise PermissionError(f"package_interface is not executable: {interface}")
+        if not state["readable"]:
+            raise PermissionError(
+                f"package_interface cannot be read for provenance hashing: {interface}"
+            )
+    except Exception as exc:
+        return {
+            "error": f"preparation runtime unavailable: {type(exc).__name__}: {exc}",
+            "runtime_ready": False,
+        }
+    return None
+
+
 def cmd_lab_info(args: argparse.Namespace, lab: Laboratory) -> int:
+    computing_module = _component_state(lab.computing_module)
+    task_setup = {
+        "path": str(lab.task_setup_template),
+        "exists": lab.task_setup_template.is_dir(),
+        "named_task_setup": lab.task_setup_template.name == "task_setup",
+    }
+    package_interfaces = {
+        name: _component_state(path)
+        for name, path in sorted(lab.package_interfaces.items())
+    }
+    preparation_ready = {
+        name: bool(
+            task_setup["exists"]
+            and task_setup["named_task_setup"]
+            and _component_ready(component)
+        )
+        for name, component in package_interfaces.items()
+    }
+    preparation_ready.setdefault("0d", False)
+    preparation_ready.setdefault("1d", False)
+    unavailable: list[str] = []
+    unreadable: list[str] = []
+    if not _component_ready(computing_module):
+        unavailable.append("computing_module")
+    if (
+        computing_module["exists"]
+        and computing_module["executable"]
+        and not computing_module["readable"]
+    ):
+        unreadable.append("computing_module")
+    if not task_setup["exists"]:
+        unavailable.append("task_setup")
+    elif not task_setup["named_task_setup"]:
+        unavailable.append("task_setup_name")
+    for name, component in package_interfaces.items():
+        if not _component_ready(component):
+            unavailable.append(f"package_interface_{name}")
+        if component["exists"] and component["executable"] and not component["readable"]:
+            unreadable.append(f"package_interface_{name}")
+
     runtime = {
-        "computing_module_sha256": sha256_file(lab.computing_module),
-        "package_interface_0d_sha256": sha256_file(lab.package_interface_0d),
+        "computing_module_sha256": computing_module["sha256"],
+        "package_interface_0d_sha256": package_interfaces.get("0d", {}).get("sha256"),
+        "computing_module": computing_module,
+        "task_setup": task_setup,
+        "package_interfaces": package_interfaces,
+        "execution_ready": _component_ready(computing_module),
+        "preparation_ready": preparation_ready,
+        "preparation_ready_0d": preparation_ready["0d"],
+        "preparation_ready_1d": preparation_ready["1d"],
+        # runtime_available means at least one runtime capability is present.
+        # It is NOT a statement that CFD execution is ready; use execution_ready
+        # or preparation_ready_* for operational decisions.
+        "runtime_available": bool(
+            _component_ready(computing_module) or any(preparation_ready.values())
+        ),
+        "unavailable": unavailable,
+        "unreadable": unreadable,
     }
     return emit({"laboratory": lab.to_dict(), "runtime": runtime, "bridge_version": PROJECT_VERSION})
 
@@ -1399,7 +1526,20 @@ def cmd_campaign_prepare(args: argparse.Namespace, lab: Laboratory) -> int:
     if not setups_dir.is_dir():
         return emit({"error": f"setup directory not found: {setups_dir}; generate campaign files first"}, 2)
 
-    interface = package_interface_for_generated(cases, lab)
+    try:
+        interface = package_interface_for_generated(cases, lab)
+    except Exception as exc:
+        return emit(
+            {
+                "error": f"preparation runtime unavailable: {type(exc).__name__}: {exc}",
+                "runtime_ready": False,
+            },
+            2,
+        )
+
+    runtime_error = _preparation_runtime_error(lab, interface)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
 
     prep_dir = cases.parent / "_preparation"
     prep_dir.mkdir(parents=True, exist_ok=True)
@@ -1751,6 +1891,10 @@ def cmd_campaign_rerun_start(args: argparse.Namespace, lab: Laboratory) -> int:
             "run_config": str(config),
         }, 2)
 
+    runtime_error = _execution_runtime_error(lab)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
+
     plan = selective_rerun_plan(cases, list(args.case_id), lab, config)
     if not plan.get("can_start"):
         return emit({"error": "selective rerun preflight failed", "plan": plan}, 3)
@@ -2091,6 +2235,8 @@ def physical_launch_plan(
     if not config.is_file():
         return {"error": f"trusted runner configuration not found: {config}", "can_start": False}
 
+    runtime_error = _execution_runtime_error(lab)
+
     rows = load_cases(cases)
     by_id = {str(row.get("case_id", "")).strip(): row for row in rows}
     if selected_ids is None:
@@ -2147,6 +2293,11 @@ def physical_launch_plan(
 
     lock = probe_runner_lock(lab.campaign_root)
     blockers: list[dict[str, Any]] = []
+    if runtime_error is not None:
+        blockers.append({
+            "reason": "execution_runtime_unavailable",
+            "error": runtime_error["error"],
+        })
     if lock.get("active"):
         blockers.append({"reason": "laboratory_runner_active", "laboratory_runner": lock})
     if incompatible:
@@ -2309,6 +2460,9 @@ def cmd_campaign_start(args: argparse.Namespace, lab: Laboratory) -> int:
     config = resolve(args.run_config) if args.run_config else lab.runner_config
     if not cases.is_file() or not config.is_file():
         return emit({"error": "cases.csv or trusted runner configuration not found", "cases": str(cases), "run_config": str(config)}, 2)
+    runtime_error = _execution_runtime_error(lab)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
     status = campaign_status_payload(cases, lab, config)
     if status["missing_cases"]:
         return emit({"error": "campaign contains missing case directories; generate setups before running", "status": status}, 3)
@@ -4691,7 +4845,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        lab = Laboratory.load(args.laboratory)
+        lab = Laboratory.load(args.laboratory, require_runtime=False)
         commands = {
             "lab-info": cmd_lab_info,
             "campaign-list": cmd_campaign_list,
