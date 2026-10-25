@@ -367,7 +367,7 @@ class BridgeRuntimeBoundaryTests(unittest.TestCase):
             self.assertFalse(payload["can_start"])
             reasons = [item["reason"] for item in payload["blockers"]]
             self.assertIn("execution_runtime_unavailable", reasons)
-            
+
             # The physical preflight creates a lock file but no CFD job.
             jobs_dir = root / "campaigns" / "_jobs"
             self.assertTrue(jobs_dir.is_dir())
