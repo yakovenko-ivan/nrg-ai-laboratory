@@ -1,5 +1,6 @@
 [study]
 name = "template"
+# `name` is replaced by agent_workspace/create_study.py with the requested slug.
 write_canonical_history = false
 
 # For large studies, the trusted runner exposes pilot/full mode and a shared
