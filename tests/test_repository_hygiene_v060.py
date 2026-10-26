@@ -61,7 +61,13 @@ class RepositoryHygieneV060Tests(unittest.TestCase):
         names = {item["name"]: item for item in report["checks"]}
         self.assertEqual(names["computing-module"]["severity"], "required")
         self.assertFalse(report["summary"]["nrg_runtime_ready"])
-        self.assertFalse(report["summary"]["repository_ready"])
+        # P1C semantics change (intentional, documented): --require-nrg promotes
+        # NRG checks to required severity for the CLI gate, but a missing external
+        # NRG project is not a repository defect.  repository_ready therefore
+        # remains true for a valid clone without NRG.
+        self.assertTrue(report["summary"]["repository_ready"])
+        self.assertEqual(report["summary"]["repository_failures"], 0)
+        self.assertFalse(report["summary"]["full_environment_ready"])
 
     def test_no_known_developer_machine_paths_are_committed(self):
         forbidden = (
