@@ -577,5 +577,35 @@ class DevTransactionTests(unittest.TestCase):
             self.assertNotIn(".pi", root)
 
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group cleanup test")
+    def test_run_test_process_kills_child_tree_on_timeout(self):
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pidfile = root / "tree.json"
+            child = (
+                "import json, os, pathlib, subprocess, sys, time\n"
+                "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(pidfile)!r}).write_text("
+                f"json.dumps({{'child': os.getpid(), 'grandchild': g.pid}}))\n"
+                "time.sleep(60)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                dev._run_test_process([sys.executable, "-c", child], root, os.environ.copy(), 1)
+            ids = json.loads(pidfile.read_text())
+
+            def alive(pid: int) -> bool:
+                try:
+                    stat = Path(f"/proc/{pid}/stat").read_text()
+                except FileNotFoundError:
+                    return False
+                return stat.rsplit(") ", 1)[1].split()[0] != "Z"
+
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and any(alive(p) for p in ids.values()):
+                time.sleep(0.05)
+            self.assertFalse(any(alive(p) for p in ids.values()), ids)
+
 if __name__ == "__main__":
     unittest.main()

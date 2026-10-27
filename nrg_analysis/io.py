@@ -12,6 +12,7 @@ from typing import Iterable, Mapping
 from . import namelist
 
 NUMBER_RE = re.compile(r"[-+]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[EeDd][-+]?\d+)?")
+_METADATA_RE = re.compile(r"^\s*(?:TITLE|VARIABLES)\s*=", re.IGNORECASE)
 TIME_FACTORS = {
     "seconds": 1.0,
     "milliseconds": 1.0e-3,
@@ -61,16 +62,46 @@ def parse_number_line(line: str) -> list[float]:
     return [float(m.group(0).replace("D", "E").replace("d", "e")) for m in NUMBER_RE.finditer(line)]
 
 
+def _is_metadata_line(line: str) -> bool:
+    return bool(_METADATA_RE.match(line))
+
+
+def _parse_numeric_row(line: str, path: Path, line_number: int) -> list[float]:
+    """Parse one complete numeric record without accepting stray text."""
+    values: list[float] = []
+    cursor = 0
+    for match in NUMBER_RE.finditer(line):
+        gap = line[cursor : match.start()]
+        if gap.strip():
+            raise ValueError(f"{path}:{line_number}: malformed numeric row near {gap.strip()!r}")
+        token = match.group(0)
+        try:
+            values.append(float(token.replace("D", "E").replace("d", "e")))
+        except ValueError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid numeric token {token!r}") from exc
+        cursor = match.end()
+    tail = line[cursor:]
+    if tail.strip():
+        raise ValueError(f"{path}:{line_number}: malformed numeric row near {tail.strip()!r}")
+    if not values:
+        raise ValueError(f"{path}:{line_number}: no numeric values")
+    return values
+
+
 def read_numeric_rows(path: str | Path) -> list[list[float]]:
     rows: list[list[float]] = []
     path = Path(path)
+    data_started = False
     with path.open(encoding="utf-8", errors="replace") as stream:
-        for line in stream:
+        for line_number, line in enumerate(stream, 1):
             if not line.strip():
                 continue
-            values = parse_number_line(line)
-            if values:
-                rows.append(values)
+            if _is_metadata_line(line):
+                if data_started:
+                    raise ValueError(f"{path}:{line_number}: metadata line after numerical data")
+                continue
+            rows.append(_parse_numeric_row(line, path, line_number))
+            data_started = True
     if not rows:
         raise ValueError(f"no numerical rows in {path}")
     width = len(rows[0])

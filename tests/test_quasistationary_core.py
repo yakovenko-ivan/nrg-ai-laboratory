@@ -12,6 +12,91 @@ from nrg_analysis.quasistationary_core import (
 )
 
 
+G3C_SPECIES = (
+    "H2",
+    "O2",
+    "N2",
+    "O",
+    "H",
+    "OH",
+    "H2O",
+    "HO2",
+    "H2O2",
+    "AR",
+    "HE",
+)
+# Exact binary fractions: the synthetic species sum is exactly 1.0.
+G3C_MASS_FRACTIONS = (
+    0.25,
+    0.125,
+    0.25,
+    0.0625,
+    0.03125,
+    0.015625,
+    0.125,
+    0.03125,
+    0.015625,
+    0.0625,
+    0.03125,
+)
+
+
+def _g3c_setup_text() -> str:
+    lines = [
+        "&pproc_parameters",
+        " post_processor_output_file='reactor_history.dat',",
+        f" operations_number={3 + len(G3C_SPECIES)},",
+        " save_time=0.1,",
+        " save_time_units='microseconds'",
+        "/",
+    ]
+    fields = ["temperature", "pressure", "density"]
+    fields.extend(f"specie_mass_fraction({species})" for species in G3C_SPECIES)
+    for field in fields:
+        lines.extend(
+            [
+                "&pproc_operation",
+                f" field_name='{field}',",
+                " operation_type='transducer'",
+                "/",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _g3c_variables_line() -> str:
+    names = [
+        "time [us]",
+        "temperature_transducer",
+        "x [m]",
+        "pressure_transducer",
+        "density_transducer",
+    ]
+    names.extend(f"specie_mass_fraction({species})_transducer" for species in G3C_SPECIES)
+    return "TITLE=\"NRG post-processor\"\nVARIABLES=" + " ".join(
+        f'"{name}"' for name in names
+    )
+
+
+def _g3c_row(time_us: float, temperature_k: float) -> str:
+    values = [
+        time_us,
+        temperature_k,
+        0.00005,
+        101325.0,
+        0.28618308058,
+        *G3C_MASS_FRACTIONS,
+    ]
+    return " ".join(f"{value:.12E}" for value in values)
+
+
+def _write_g3c_case(case: Path, body: str) -> None:
+    setup = case / "task_setup"
+    setup.mkdir()
+    (setup / "post_processor_1.inf").write_text(_g3c_setup_text(), encoding="utf-8")
+    (case / "reactor_history.dat").write_text(body, encoding="utf-8")
+
+
 def profile(name="test", dY=1e-8, relT=1e-6, relP=1e-6):
     return CoreProfile.from_mapping(name, {
         "check_wall_interval_s": 1.0,
@@ -133,6 +218,116 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(p.check_wall_interval_s, 1.0)
         self.assertEqual(p.relative_temperature_span, 1e-5)
         self.assertEqual(p.max_species_mass_fraction_span, 1e-6)
+
+    def test_online_headered_g3c_schema_returns_2000_physical_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = _g3c_variables_line() + "\n" + "\n".join(
+                _g3c_row(index * 0.1, 1000.0 + index * 0.001)
+                for index in range(2000)
+            ) + "\n"
+            _write_g3c_case(case, body)
+
+            history = parse_reactor_history(case)
+            self.assertEqual(len(history["time_s"]), 2000)
+            self.assertAlmostEqual(history["time_s"][0], 0.0)
+            self.assertAlmostEqual(history["time_s"][-1], 199.9e-6)
+            self.assertEqual(history["species_names"], G3C_SPECIES)
+            self.assertEqual(history["temperature_K"][0], 1000.0)
+            self.assertEqual(history["pressure_Pa"][0], 101325.0)
+            self.assertEqual(history["density_kg_m3"][0], 0.28618308058)
+            for index in (0, 999, 1999):
+                total = sum(
+                    history["species_series"][species][index]
+                    for species in G3C_SPECIES
+                )
+                self.assertEqual(total, 1.0)
+
+    def test_online_headered_partial_trailing_row_is_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = "\n".join(
+                [
+                    _g3c_variables_line(),
+                    _g3c_row(0.0, 1000.0),
+                    _g3c_row(0.11, 1000.1),
+                    "0.22 1000 1 101325",
+                    "",
+                ]
+            )
+            _write_g3c_case(case, body)
+            history = parse_reactor_history(case)
+            self.assertEqual(len(history["time_s"]), 2)
+            self.assertAlmostEqual(history["time_s"][1], 0.11e-6)
+
+    def test_online_malformed_interior_row_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = "\n".join(
+                [
+                    _g3c_variables_line(),
+                    _g3c_row(0.0, 1000.0),
+                    _g3c_row(0.11, 1000.1) + " trailing",
+                    _g3c_row(0.22, 1000.2),
+                    "",
+                ]
+            )
+            _write_g3c_case(case, body)
+            with self.assertRaisesRegex(ValueError, "malformed numeric row"):
+                parse_reactor_history(case)
+
+    def test_online_metadata_after_data_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = "\n".join(
+                [
+                    _g3c_variables_line(),
+                    _g3c_row(0.0, 1000.0),
+                    'TITLE="late"',
+                    "",
+                ]
+            )
+            _write_g3c_case(case, body)
+            with self.assertRaisesRegex(ValueError, "metadata line after numerical data"):
+                parse_reactor_history(case)
+
+    def test_online_unsupported_header_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = 'ZONE T="unsupported"\n' + _g3c_row(0.0, 1000.0) + "\n"
+            _write_g3c_case(case, body)
+            with self.assertRaisesRegex(ValueError, "malformed numeric row"):
+                parse_reactor_history(case)
+
+    def test_online_malformed_final_newline_row_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = "\n".join(
+                [
+                    _g3c_variables_line(),
+                    _g3c_row(0.0, 1000.0),
+                    "0.11 1000 1 101325 trailing",
+                    "",
+                ]
+            )
+            _write_g3c_case(case, body)
+            with self.assertRaisesRegex(ValueError, "malformed numeric row"):
+                parse_reactor_history(case)
+
+    def test_online_unterminated_truncated_final_record_is_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            case = Path(td)
+            body = (
+                _g3c_variables_line()
+                + "\n"
+                + _g3c_row(0.0, 1000.0)
+                + "\n"
+                + _g3c_row(0.11, 1000.1)
+                + "\n0.22 1000 1 1.013E"
+            )
+            _write_g3c_case(case, body)
+            history = parse_reactor_history(case)
+            self.assertEqual(len(history["time_s"]), 2)
 
 
 if __name__ == "__main__":

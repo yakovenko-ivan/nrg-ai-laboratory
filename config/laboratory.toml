@@ -34,3 +34,26 @@ package_interface_1d = ".local/NRG/build/bin/package_interface_1D_wall_flame_cam
 default_threads = 1
 runner_config = "config/campaign_runner.json"
 termination_profiles = "config/termination_profiles.json"
+
+# Operational equilibrium-validation settings (Mode 3, Route B) -- R2-corrected.
+# Portable, machine-independent keys only.  Machine-local absolute roots
+# (nrg_source_root, build_root, run_root, harness, cantera_python) live in
+# config/laboratory.local.toml under a matching [e0] table and are merged
+# (local wins) by lab_bridge._e0_config.  See
+# config/laboratory.local.toml.example for the local-only keys.
+#
+# TRUST-ANCHOR SEPARATION (R2): this [e0] table is OPERATIONAL ONLY and is never
+# authoritative.  The authoritative pins (commit, source/harness SHA-256, cmake
+# target/selector, mechanism selector) and the fixed researcher-approved
+# acceptance thresholds live in config/e0_authorization.toml, a self-protected
+# record installed OUT-OF-BAND (see trust_policy_proposal.md in the
+# e0_mode3_patch_review study).  Nothing here carries a pin-like authority, and
+# lab_bridge._e0_authorization() fails closed if that record is absent or
+# inconsistent with the fixed constants.
+[e0]
+equilibrium_executable = "package_interface_0D_chemical_equilibrium_validation"
+build_type = "release"
+parallel_jobs = 4
+# Total per-command deadline (R4): must leave a cleanup margin below the
+# index.ts bridge timeout (E0_TIMEOUT_MS = 1800 s).  1680 s + 120 s margin = 1800 s.
+timeout_seconds = 1680

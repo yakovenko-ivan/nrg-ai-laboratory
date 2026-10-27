@@ -23,7 +23,8 @@
     ".pi/extensions/nrg-laboratory/index.ts",
     ".pi/extensions/nrg-laboratory/read_only_shell.ts",
     "config/read_only_shell_policy.json",
-    "AGENTS.md"
+    "AGENTS.md",
+    "config/e0_authorization.toml"
   ],
   "self_protection_semantics": "Ordinary nrg_dev_* transactions must not rewrite the guarded-development trusted computing base. Changes to this security boundary require a separate out-of-band security bootstrap (or a future stronger security_boundary transaction class), not an ordinary development transaction.",
   "allowed_test_profiles": [
@@ -42,7 +43,7 @@
   "max_read_lines": 2000,
   "test_path_pattern": "^tests/[A-Za-z0-9_./-]+\\.py$",
   "test_node_selector_pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
-  "test_execution_trust": "Test commands are fixed/normalized by trusted profiles; subprocess arguments are never passed through a shell; environment is sanitized; CWD/PYTHONPATH are bound to the isolated worktree. Candidate source state is checked before and after the test; a changed candidate state yields integrity_failed and is not bound as validation. Nevertheless candidate Python executed by pytest has the permissions of the local user; this is NOT an OS sandbox. Human confirmation before a test profile is a real trust boundary.",
+  "test_execution_trust": "Test commands are fixed/normalized by trusted profiles; subprocess arguments are never passed through a shell; environment is sanitized; CWD/PYTHONPATH are bound to the isolated worktree. Candidate source state is checked before and after the test; a changed candidate state yields integrity_failed and is not bound as validation. Nevertheless candidate Python executed by pytest has the permissions of the local user; this is NOT an OS sandbox. The transaction-start confirmation authorizes candidate writes/edits and named test profiles for that transaction under a process-local, session-bound, time-limited grant; calls with no active grant fail closed; commit/discard/apply_patch remain separately confirmed.",
   "commit_validation_policy": "Commit requires current-tree diff_check=pass AND at least one current-tree pytest profile (targeted_pytest or full_pytest) with pass; a current-tree fail or integrity_failed result blocks commit; environment_blocked is not a passing substitute.",
   "commit_branch_prefix": "agent-dev/"
 }

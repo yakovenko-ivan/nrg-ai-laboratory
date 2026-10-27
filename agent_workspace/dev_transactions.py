@@ -61,6 +61,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -532,6 +533,8 @@ def transaction_plan(lab, task: str, rationale: str, allowed_paths: list[str]) -
         "development_branch": _branch_name(tid),
         "worktree": str(_worktree_dir_path(lab, policy, tid)),
         "allowed_paths": allow,
+        "allowed_test_profiles": policy.get("allowed_test_profiles", []),
+        "test_timeout_seconds": 1800,
         "denylist": policy["denylist"],
         "self_protected_paths": policy.get("self_protected_paths", []),
         "dirty_paths": dirty,
@@ -1279,6 +1282,30 @@ def _classify_test(profile: str, require_nrg: bool, returncode: int, stdout: str
     return "pass"
 
 
+def _run_test_process(cmd: list[str], wt: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a named test profile; on POSIX kill the whole process group on timeout."""
+    if os.name != "posix":
+        # Conservative fallback: no process-group guarantee on non-POSIX.
+        return subprocess.run(cmd, cwd=str(wt), text=True, capture_output=True,
+                              timeout=timeout, env=env, shell=False)
+    proc = subprocess.Popen(cmd, cwd=str(wt), text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, shell=False,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def test_execute(lab, tid: str, profile: str, test_files: list[str] | None = None,
                  require_nrg: bool = False,
                  expected_candidate_tree_sha: str | None = None,
@@ -1334,8 +1361,7 @@ def test_execute(lab, tid: str, profile: str, test_files: list[str] | None = Non
 
     env = _sanitized_env(wt) if profile != "diff_check" else os.environ.copy()
     started = time.monotonic()
-    proc = subprocess.run(cmd, cwd=str(wt), text=True, capture_output=True,
-                          timeout=1800, env=env, shell=False)
+    proc = _run_test_process(cmd, wt, env, 1800)
     duration_ms = int((time.monotonic() - started) * 1000)
     log = (proc.stdout or "") + ("\n--- stderr ---\n" if proc.stderr else "") + (proc.stderr or "")
     log_path = _persist_log(lab, policy, tid, profile, log)

@@ -16,6 +16,12 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+# OPTIONAL independent reference for NRG validation only.  Cantera is NOT a
+# laboratory dependency: it is not required for the generic laboratory, agent
+# registration, routine campaigns, the NRG build, or native NRG diagnostics.
+# Install deliberately with:  pip install -e '.[cantera]'
+cantera = ["cantera==3.2.0"]
+
 visualization = [
     "numpy>=2.5,<3",
     "matplotlib>=3.11,<4",

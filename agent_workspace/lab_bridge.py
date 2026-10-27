@@ -744,10 +744,137 @@ def cmd_study_list(args: argparse.Namespace, lab: Laboratory) -> int:
             records.append(record)
     return emit({"studies_root": str(root), "count": len(records), "studies": records})
 
+def _component_state(path: Path) -> dict[str, Any]:
+    exists = path.is_file()
+    executable = bool(exists and (os.name == "nt" or os.access(path, os.X_OK)))
+    digest: str | None = None
+    read_error: str | None = None
+    if exists:
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "path": str(path),
+        "exists": bool(exists),
+        "executable": executable,
+        "readable": digest is not None,
+        "sha256": digest,
+        "read_error": read_error,
+    }
+
+
+def _component_ready(component: dict[str, Any]) -> bool:
+    # Ready means present, executable, and hashable.  A file that exists and is
+    # executable but cannot be read has no verified provenance and must not be
+    # reported as a usable runtime component.
+    return bool(component.get("executable") and component.get("readable"))
+
+
+def _execution_runtime_error(lab: Laboratory) -> dict[str, Any] | None:
+    try:
+        lab.validate_execution_runtime()
+        if not _component_ready(_component_state(lab.computing_module)):
+            raise PermissionError(
+                "computing_module exists and is executable but cannot be read for "
+                f"provenance hashing: {lab.computing_module}"
+            )
+    except Exception as exc:
+        return {
+            "error": f"execution runtime unavailable: {type(exc).__name__}: {exc}",
+            "runtime_ready": False,
+        }
+    return None
+
+
+def _preparation_runtime_error(
+    lab: Laboratory, interface: Path
+) -> dict[str, Any] | None:
+    try:
+        if lab.task_setup_template.name != "task_setup":
+            raise ValueError(
+                "task_setup_template must point to a directory named 'task_setup'"
+            )
+        if not lab.task_setup_template.is_dir():
+            raise FileNotFoundError(
+                f"task_setup_template not found: {lab.task_setup_template}"
+            )
+        state = _component_state(interface)
+        if not state["exists"]:
+            raise FileNotFoundError(f"package_interface not found: {interface}")
+        if not state["executable"]:
+            raise PermissionError(f"package_interface is not executable: {interface}")
+        if not state["readable"]:
+            raise PermissionError(
+                f"package_interface cannot be read for provenance hashing: {interface}"
+            )
+    except Exception as exc:
+        return {
+            "error": f"preparation runtime unavailable: {type(exc).__name__}: {exc}",
+            "runtime_ready": False,
+        }
+    return None
+
+
 def cmd_lab_info(args: argparse.Namespace, lab: Laboratory) -> int:
+    computing_module = _component_state(lab.computing_module)
+    task_setup = {
+        "path": str(lab.task_setup_template),
+        "exists": lab.task_setup_template.is_dir(),
+        "named_task_setup": lab.task_setup_template.name == "task_setup",
+    }
+    package_interfaces = {
+        name: _component_state(path)
+        for name, path in sorted(lab.package_interfaces.items())
+    }
+    preparation_ready = {
+        name: bool(
+            task_setup["exists"]
+            and task_setup["named_task_setup"]
+            and _component_ready(component)
+        )
+        for name, component in package_interfaces.items()
+    }
+    preparation_ready.setdefault("0d", False)
+    preparation_ready.setdefault("1d", False)
+    unavailable: list[str] = []
+    unreadable: list[str] = []
+    if not _component_ready(computing_module):
+        unavailable.append("computing_module")
+    if (
+        computing_module["exists"]
+        and computing_module["executable"]
+        and not computing_module["readable"]
+    ):
+        unreadable.append("computing_module")
+    if not task_setup["exists"]:
+        unavailable.append("task_setup")
+    elif not task_setup["named_task_setup"]:
+        unavailable.append("task_setup_name")
+    for name, component in package_interfaces.items():
+        if not _component_ready(component):
+            unavailable.append(f"package_interface_{name}")
+        if component["exists"] and component["executable"] and not component["readable"]:
+            unreadable.append(f"package_interface_{name}")
+
     runtime = {
-        "computing_module_sha256": sha256_file(lab.computing_module),
-        "package_interface_0d_sha256": sha256_file(lab.package_interface_0d),
+        "computing_module_sha256": computing_module["sha256"],
+        "package_interface_0d_sha256": package_interfaces.get("0d", {}).get("sha256"),
+        "computing_module": computing_module,
+        "task_setup": task_setup,
+        "package_interfaces": package_interfaces,
+        "execution_ready": _component_ready(computing_module),
+        "preparation_ready": preparation_ready,
+        "preparation_ready_0d": preparation_ready["0d"],
+        "preparation_ready_1d": preparation_ready["1d"],
+        # runtime_available means at least one runtime capability is present.
+        # It is NOT a statement that CFD execution is ready; use execution_ready
+        # or preparation_ready_* for operational decisions.
+        "runtime_available": bool(
+            _component_ready(computing_module) or any(preparation_ready.values())
+        ),
+        "unavailable": unavailable,
+        "unreadable": unreadable,
     }
     return emit({"laboratory": lab.to_dict(), "runtime": runtime, "bridge_version": PROJECT_VERSION})
 
@@ -1399,7 +1526,20 @@ def cmd_campaign_prepare(args: argparse.Namespace, lab: Laboratory) -> int:
     if not setups_dir.is_dir():
         return emit({"error": f"setup directory not found: {setups_dir}; generate campaign files first"}, 2)
 
-    interface = package_interface_for_generated(cases, lab)
+    try:
+        interface = package_interface_for_generated(cases, lab)
+    except Exception as exc:
+        return emit(
+            {
+                "error": f"preparation runtime unavailable: {type(exc).__name__}: {exc}",
+                "runtime_ready": False,
+            },
+            2,
+        )
+
+    runtime_error = _preparation_runtime_error(lab, interface)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
 
     prep_dir = cases.parent / "_preparation"
     prep_dir.mkdir(parents=True, exist_ok=True)
@@ -1751,6 +1891,10 @@ def cmd_campaign_rerun_start(args: argparse.Namespace, lab: Laboratory) -> int:
             "run_config": str(config),
         }, 2)
 
+    runtime_error = _execution_runtime_error(lab)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
+
     plan = selective_rerun_plan(cases, list(args.case_id), lab, config)
     if not plan.get("can_start"):
         return emit({"error": "selective rerun preflight failed", "plan": plan}, 3)
@@ -2091,6 +2235,8 @@ def physical_launch_plan(
     if not config.is_file():
         return {"error": f"trusted runner configuration not found: {config}", "can_start": False}
 
+    runtime_error = _execution_runtime_error(lab)
+
     rows = load_cases(cases)
     by_id = {str(row.get("case_id", "")).strip(): row for row in rows}
     if selected_ids is None:
@@ -2147,6 +2293,11 @@ def physical_launch_plan(
 
     lock = probe_runner_lock(lab.campaign_root)
     blockers: list[dict[str, Any]] = []
+    if runtime_error is not None:
+        blockers.append({
+            "reason": "execution_runtime_unavailable",
+            "error": runtime_error["error"],
+        })
     if lock.get("active"):
         blockers.append({"reason": "laboratory_runner_active", "laboratory_runner": lock})
     if incompatible:
@@ -2309,6 +2460,9 @@ def cmd_campaign_start(args: argparse.Namespace, lab: Laboratory) -> int:
     config = resolve(args.run_config) if args.run_config else lab.runner_config
     if not cases.is_file() or not config.is_file():
         return emit({"error": "cases.csv or trusted runner configuration not found", "cases": str(cases), "run_config": str(config)}, 2)
+    runtime_error = _execution_runtime_error(lab)
+    if runtime_error is not None:
+        return emit(runtime_error, 2)
     status = campaign_status_payload(cases, lab, config)
     if status["missing_cases"]:
         return emit({"error": "campaign contains missing case directories; generate setups before running", "status": status}, 3)
@@ -2922,6 +3076,1463 @@ def cmd_dev_discard_execute(args: argparse.Namespace, lab: Laboratory) -> int:
                                     args.expected_unexpected_change or None))
 
 
+# ---------------------------------------------------------------------------
+# E0 Mode 3 (Route B) -- R3-corrected.  Authoritative pins (commit, source/
+# harness/validation-config SHA-256, cmake target/selector, mechanism selector)
+# and the fixed researcher-approved acceptance thresholds live ONLY in the
+# protected authorization record read by _e0_authorization(); the ordinary [e0]
+# table holds operational paths/settings and is never authoritative (R2).  Bounded
+# subprocesses use a fixed argv, a minimal env allowlist, and whole-process-tree
+# kill on timeout (R3).  Mandatory finite result.json checks and precise
+# recomputed-vs-inspected evidence claims are enforced (R4/R5).  validation_config.json
+# is authenticated at plan+execute via validation_config_sha256, and
+# _e0_parse_results requires exactly one KEROMNES record with complete TP/HP
+# blocks (validation-config round).  A subprocess return code of zero is never
+# treated as a scientific PASS.
+# ---------------------------------------------------------------------------
+
+import signal
+
+# Operation-scoped operational key sets (optional-Cantera contract):
+#   build      -> NRG source + isolated build root + executable name only
+#   validation -> additionally the isolated run root, the pinned harness, and
+#                 an explicitly configured Cantera interpreter launcher
+_E0_BASE_REQUIRED_KEYS = (
+    "nrg_source_root", "build_root", "equilibrium_executable",
+)
+_E0_VALIDATION_REQUIRED_KEYS = ("run_root", "harness", "cantera_python")
+_E0_REQUIRED_KEYS = _E0_BASE_REQUIRED_KEYS + _E0_VALIDATION_REQUIRED_KEYS
+_E0_BASE_PATH_KEYS = ("nrg_source_root", "build_root")
+_E0_PATH_KEYS = _E0_BASE_PATH_KEYS + _E0_VALIDATION_REQUIRED_KEYS
+_E0_OPERATIONS = ("build", "validation")
+# Optional independent reference: only these keys may be absent without making
+# the generic laboratory or the NRG package-interface build unready.
+_E0_OPTIONAL_REFERENCE_KEYS = frozenset({"cantera_python"})
+
+# Optional-reference verification statuses.  These describe the independent
+# reference only; they are never generic laboratory readiness and never a
+# scientific PASS or FAIL of NRG itself.
+_E0_REFERENCE_NOT_CONFIGURED = "REFERENCE_NOT_CONFIGURED"
+_E0_REFERENCE_UNVERIFIED = "REFERENCE_UNVERIFIED"
+_E0_REFERENCE_AVAILABLE = "REFERENCE_AVAILABLE"
+_E0_CANTERA_UNAVAILABLE = "CANTERA_UNAVAILABLE"
+_E0_CANTERA_PROBE = "import cantera; print(cantera.__version__); print(cantera.__file__)"
+_E0_REFERENCE_PROBE_TIMEOUT_S = 120
+_E0_SOURCE_REL = "package_interface/src/tests/classic_tests/0D_chemical_equilibrium_validation.f90"
+_E0_CMAKE_SELECTOR = "src/tests/classic_tests/0D_chemical_equilibrium_validation.f90"
+_E0_CMAKE_TARGET = "package_interface"
+_E0_TASK_SETUP_REL = "package_interface/task_setup"
+_E0_CONFIG_REL = "validation_config.json"
+_V3_MARKER = "NRG_CHEMKIN_VALIDATION_AUDIT_V3"
+_E0_MECHANISM_SELECTOR = "hydrogen/KEROMNES.txt"
+_E0_SIX_MECHANISMS = (
+    "hydrogen/KEROMNES.txt",
+    "hydrogen/KONNOV.txt",
+    "hydrogen/TEREZA.txt",
+    "hydrogen/ZHANG.txt",
+    "ammonia/OKAFOR.txt",
+    "acetylene/VARATHARAJAN.txt",
+)
+# Expected reference pressure (Pa) for these atmospheric equilibrium cases
+# (matches the historical archive and the harness's fixed problem definition).
+_E0_EXPECTED_PRESSURE_PA = 101325.0
+
+# Protected authorization record (R2): researcher-installed and self-protected
+# OUT-OF-BAND.  This is where the authoritative pins live; the ordinary [e0]
+# table must never carry authoritative pins.  Fail closed if absent/malformed.
+_E0_AUTH_REL = "config/e0_authorization.toml"
+_E0_AUTH_PINS = (
+    "commit", "source_sha256", "harness_sha256", "validation_config_sha256",
+    "source_relative", "cmake_selector", "cmake_target", "mechanism_selector",
+)
+# Exactly the researcher-approved acceptance keys (R6).  The fixed threshold
+# VALUES live in the protected authorization record; [e0] cannot broaden them.
+# Missing or
+# extra keys fail closed; no default threshold is ever silently inserted.
+_E0_ACCEPTANCE_KEYS = (
+    "normalization_tolerance",
+    "nonnegativity_tolerance",
+    "element_conservation_tolerance",
+    "mass_conservation_tolerance",
+    "enthalpy_residual_tolerance",
+    "mole_fraction_tolerance",
+    "temperature_tolerance_K",
+)
+_E0_ACCEPTANCE_MAX = {
+    "normalization_tolerance": 1.0,
+    "nonnegativity_tolerance": 1.0,
+    "element_conservation_tolerance": 1.0,
+    "mass_conservation_tolerance": 1.0,
+    "enthalpy_residual_tolerance": 1.0,
+    "mole_fraction_tolerance": 1.0,
+    "temperature_tolerance_K": 1000.0,
+}
+# NRG-reported residual diagnostics (R4/R5).  All five are present in both TP and
+# HP archived CSVs and in result.json's nrg_diagnostics; missing/duplicate keys
+# are rejected, never defaulted.  The first three map to an acceptance tolerance;
+# mole_fraction_sum_residual/stationarity_residual are validated for
+# presence/finiteness/nonnegativity but have no independent tolerance.
+_E0_RESIDUAL_KEYS = (
+    "max_element_relative_residual",
+    "mass_relative_residual",
+    "mole_fraction_sum_residual",
+    "stationarity_residual",
+    "enthalpy_relative_residual",
+)
+_E0_RESIDUAL_TOL = {
+    "max_element_relative_residual": "element_conservation_tolerance",
+    "mass_relative_residual": "mass_conservation_tolerance",
+    "enthalpy_relative_residual": "enthalpy_residual_tolerance",
+}
+_E0_DIAGNOSTICS_KEYS = ("converged", "temperature_K", "pressure_Pa") + _E0_RESIDUAL_KEYS
+
+# Minimal explicit environment allowlist (R3/R8).  Only a fixed set of
+# runtime-relevant variables is inherited.  Git configuration, proxies,
+# LD_PRELOAD, shell init (BASH_ENV/ENV), PYTHONSTARTUP, and every other user
+# variable are DROPPED so a malicious environment variable cannot reach a
+# subprocess.  Build-tool overrides (FC/CC/CXX/F77/F90) and include/library
+# path overrides (CPATH/C_INCLUDE_PATH/CPLUS_INCLUDE_PATH/LIBRARY_PATH) are
+# deliberately EXCLUDED (R8): the Fortran compiler is discovered and pinned
+# explicitly via -DCMAKE_Fortran_COMPILER, so an env-var compiler redirect
+# cannot steer the build.  (PYTHONPATH is excluded; Cantera must be found via
+# the cantera_python interpreter's own site-packages.)  PATH/HOME/
+# LD_LIBRARY_PATH remain a documented residual (NOT sandboxed) risk -- see
+# security_delta.md; this is an env allowlist, not an OS sandbox.
+_E0_ENV_ALLOWLIST = (
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE",
+    "TMPDIR", "TMP", "TEMP",
+    "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+)
+
+# Bridge/Pi timeout relationship (R4-deadline).  The index.ts bridge uses
+# E0_TIMEOUT_MS = 30 min = 1800 s for the WHOLE build and the WHOLE validate
+# command.  [e0].timeout_seconds is reinterpreted as a TOTAL per-command
+# deadline that must leave a cleanup margin so that, on timeout or external
+# cancellation, the whole-process-group SIGKILL + reap + log write completes
+# BEFORE the bridge's own timeout fires.
+_E0_BRIDGE_TIMEOUT_S = 1800
+_E0_CLEANUP_MARGIN_S = 120
+
+
+def _isfinite(x: float) -> bool:
+    return x == x and abs(x) != float("inf")
+
+
+def _is_sha256(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+
+def _sanitized_env() -> dict[str, str]:
+    """Minimal explicit environment allowlist (R3)."""
+    env: dict[str, str] = {}
+    for k in _E0_ENV_ALLOWLIST:
+        v = os.environ.get(k)
+        if v is not None:
+            env[k] = v
+    return env
+
+
+def _e0_authorization(lab: Laboratory) -> dict[str, Any]:
+    """Read the protected, researcher-installed E0 authorization record (R2).
+
+    Authoritative pins (commit, source/harness SHA-256, cmake target/selector,
+    mechanism selector) and the fixed researcher-approved acceptance thresholds
+    live ONLY here.  The record is self-protected and installed OUT-OF-BAND; the
+    ordinary [e0] table never carries authoritative pins.  Fail closed if the
+    record is absent, a symlink, malformed, or inconsistent with the fixed
+    constants.
+    """
+    auth_path = Path(lab.research_root).resolve() / _E0_AUTH_REL
+    if auth_path.is_symlink():
+        raise RuntimeError(f"authorization record is a symlink (refusing): {auth_path}")
+    if not auth_path.is_file():
+        raise RuntimeError(
+            f"E0 authorization record missing: {auth_path}; researcher installation "
+            "is out-of-band (see trust_policy_proposal.md in this study)."
+        )
+    try:
+        with auth_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:  # noqa: BLE001 -- fail closed on any read/parse error
+        raise RuntimeError(f"E0 authorization record unreadable: {exc}")
+    auth = data.get("e0_authorization")
+    if not isinstance(auth, dict):
+        raise RuntimeError("[e0_authorization] table missing in authorization record")
+    missing = [k for k in _E0_AUTH_PINS if k not in auth]
+    if missing:
+        raise RuntimeError(f"[e0_authorization] missing pins: {sorted(missing)}")
+    for k in ("source_sha256", "harness_sha256", "validation_config_sha256"):
+        if not _is_sha256(str(auth[k])):
+            raise RuntimeError(f"[e0_authorization].{k} must be a 64-char hex SHA-256")
+    commit = str(auth["commit"]).strip().lower()
+    if not (len(commit) == 40 and all(c in "0123456789abcdef" for c in commit)):
+        raise RuntimeError("[e0_authorization].commit must be a full 40-hex git commit")
+    auth["commit"] = commit
+    for k, want in (
+        ("source_relative", _E0_SOURCE_REL),
+        ("cmake_selector", _E0_CMAKE_SELECTOR),
+        ("cmake_target", _E0_CMAKE_TARGET),
+        ("mechanism_selector", _E0_MECHANISM_SELECTOR),
+    ):
+        if str(auth[k]) != want:
+            raise RuntimeError(f"[e0_authorization].{k} must equal {want!r}")
+    acc = auth.get("acceptance")
+    if not isinstance(acc, dict):
+        raise RuntimeError("[e0_authorization.acceptance] must be a table")
+    unknown = set(acc) - set(_E0_ACCEPTANCE_KEYS)
+    if unknown:
+        raise RuntimeError(f"[e0_authorization.acceptance] contains unapproved keys: {sorted(unknown)}")
+    missing_acc = set(_E0_ACCEPTANCE_KEYS) - set(acc)
+    if missing_acc:
+        raise RuntimeError(f"[e0_authorization.acceptance] missing required keys: {sorted(missing_acc)}")
+    checked: dict[str, float] = {}
+    for k in _E0_ACCEPTANCE_KEYS:
+        try:
+            v = float(acc[k])
+        except (TypeError, ValueError):
+            raise RuntimeError(f"[e0_authorization.acceptance].{k} must be numeric")
+        if not _isfinite(v):
+            raise RuntimeError(f"[e0_authorization.acceptance].{k} must be finite (NaN/Inf rejected)")
+        if v < 0.0:
+            raise RuntimeError(f"[e0_authorization.acceptance].{k} must be nonnegative")
+        if v > _E0_ACCEPTANCE_MAX[k]:
+            raise RuntimeError(f"[e0_authorization.acceptance].{k} exceeds permissible range (>{_E0_ACCEPTANCE_MAX[k]})")
+        checked[k] = v
+    auth["acceptance"] = checked
+    return auth
+
+
+def _e0_config(lab: Laboratory, operation: str = "validation") -> dict[str, Any]:
+    """Load and type-check OPERATIONAL [e0] settings only (R2).
+
+    Authoritative pins and acceptance thresholds are NOT read here; they come
+    from the protected authorization record via _e0_authorization().  [e0]
+    (config_path + local_config_path) holds paths and operational knobs only,
+    and any pin-like value it carries is at most a cross-check, never an
+    authority.
+
+    Required keys are scoped by operation (optional-Cantera contract):
+      * operation="build"      - nrg_source_root, build_root, and the
+        equilibrium executable name.  A Cantera interpreter, a validation run
+        root, and a validation harness are NOT required, so the NRG build path
+        never depends on the optional Cantera reference.
+      * operation="validation" - additionally run_root, harness, and
+        cantera_python.  Absence of only cantera_python raises
+        _E0ReferenceNotConfigured (an optional-reference status) instead of a
+        generic laboratory failure.
+    """
+    if operation not in _E0_OPERATIONS:
+        raise RuntimeError(f"[e0] unknown config operation {operation!r}; expected one of {list(_E0_OPERATIONS)}")
+    required = _E0_BASE_REQUIRED_KEYS if operation == "build" else _E0_REQUIRED_KEYS
+    tables: list[dict[str, Any]] = []
+    for src in (lab.config_path, lab.local_config_path):
+        if src is None or not src.is_file():
+            continue
+        with src.open("rb") as fh:
+            data = tomllib.load(fh)
+        e0 = data.get("e0")
+        if isinstance(e0, dict):
+            tables.append(e0)
+    merged: dict[str, Any] = {}
+    for t in tables:  # local config wins (merged last)
+        merged.update(t)
+    missing = [k for k in required if k not in merged]
+    if missing:
+        if operation == "validation" and set(missing) <= _E0_OPTIONAL_REFERENCE_KEYS:
+            raise _E0ReferenceNotConfigured(
+                f"[e0] config missing required keys: {sorted(missing)} "
+                "(optional Cantera reference not configured; generic laboratory and NRG build remain usable)"
+            )
+        raise RuntimeError(f"[e0] config missing required keys: {sorted(missing)}")
+    for key in required:
+        if not isinstance(merged[key], str) or not merged[key].strip():
+            if key in _E0_OPTIONAL_REFERENCE_KEYS:
+                raise _E0ReferenceNotConfigured(
+                    f"[e0] {key} must be a non-empty string (optional Cantera reference not configured)"
+                )
+            raise RuntimeError(f"[e0] {key} must be a non-empty string")
+    try:
+        jobs = int(merged["parallel_jobs"])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("[e0] parallel_jobs must be an int")
+    if not 1 <= jobs <= 64:
+        raise RuntimeError("[e0] parallel_jobs must be an int in 1..64")
+    merged["parallel_jobs"] = jobs
+    try:
+        timeout = int(merged["timeout_seconds"])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("[e0] timeout_seconds must be an int")
+    if timeout < 1:
+        raise RuntimeError("[e0] timeout_seconds must be positive")
+    merged["timeout_seconds"] = timeout
+    btype = str(merged.get("build_type", "release")).strip().lower()
+    if btype not in ("release", "debug"):
+        raise RuntimeError("[e0] build_type must be 'release' or 'debug'")
+    merged["build_type"] = btype
+    return merged
+
+
+def _e0_raw_path(cfg: dict[str, Any], key: str, lab: Laboratory) -> Path:
+    """Join the RAW config value against research_root WITHOUT resolving symlinks
+    or collapsing '..' (R1).  This pre-resolution form is validated before
+    canonicalization so a symlink or '..' cannot be hidden by .resolve()."""
+    raw = Path(str(cfg[key])).expanduser()
+    if not raw.is_absolute():
+        raw = Path(lab.research_root).resolve() / raw
+    return raw
+
+
+def _e0_path(cfg: dict[str, Any], key: str, lab: Laboratory) -> Path:
+    """Validate raw path components BEFORE resolving, then return the canonical
+    resolved path (R1)."""
+    raw = _e0_raw_path(cfg, key, lab)
+    _reject_raw_symlink_or_dotdot(raw)
+    return raw.resolve()
+
+
+def _e0_nrg_root(cfg: dict[str, Any], lab: Laboratory) -> Path:
+    """Canonical nrg_source_root resolved ONCE against research_root (correction 5)."""
+    return _e0_path(cfg, "nrg_source_root", lab)
+
+
+def _git(root: Path, *args: str, timeout: int = 30) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "--no-pager", "--no-optional-locks", *args],
+            capture_output=True, text=True, timeout=timeout, env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def _e0_discover_fortran() -> tuple[str, str]:
+    """Return (compiler, first version line); fail if a present compiler's --version fails."""
+    for cand in ("gfortran", "gfortran-13", "ifx", "ifort"):
+        try:
+            proc = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=10, env=_sanitized_env())
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Fortran compiler {cand} --version timed out")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Fortran compiler {cand} found but '--version' exited {proc.returncode}")
+        first = (proc.stdout or proc.stderr or "").strip().splitlines()
+        if not first:
+            raise RuntimeError(f"Fortran compiler {cand} '--version' produced no output")
+        return cand, first[0]
+    raise RuntimeError("no supported Fortran compiler found (gfortran/gfortran-13/ifx/ifort)")
+
+
+def _e0_checkout_preflight(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory) -> dict[str, Any]:
+    root = _e0_nrg_root(cfg, lab)
+    if not (root / ".git").exists():
+        raise RuntimeError(f"nrg_source_root is not a git checkout: {root}")
+    head = _git(root, "rev-parse", "HEAD").strip()
+    if head != auth["commit"]:
+        raise RuntimeError(f"NRG checkout HEAD {head[:12]} != authorized commit {auth['commit'][:12]}; researcher source review required.")
+    status = _git(root, "status", "--porcelain")
+    if status.strip():
+        raise RuntimeError(f"NRG checkout is not clean; researcher source review required:\n{status[:2000]}")
+    src = root / _E0_SOURCE_REL
+    if not src.is_file():
+        raise RuntimeError(f"NRG equilibrium source missing: {src}")
+    if _V3_MARKER not in src.read_text(encoding="utf-8"):
+        raise RuntimeError(f"NRG equilibrium source lacks {_V3_MARKER}; source review required.")
+    src_sha = sha256_file(src)
+    if auth["source_sha256"] != src_sha:
+        raise RuntimeError(f"NRG source SHA-256 {src_sha[:12]} != authorized source_sha256 {auth['source_sha256'][:12]}; source review required.")
+    return {"commit": head, "source_sha256": src_sha, "source_path": str(src)}
+
+
+def _ensure_within(path: Path, root: Path) -> None:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        raise RuntimeError(f"path escapes root: {path} not under {root}")
+
+
+def _reject_raw_symlink_or_dotdot(path: Path, allow_final_symlink: bool = False) -> None:
+    """Reject '..' or symlink components in the RAW (pre-canonicalization) path.
+
+    A symlink whose target does not exist is still rejected (Path.is_symlink()
+    is True for a broken link).  This closes the TOCTOU gap where .resolve()
+    would silently follow the link before the overlap check runs.
+
+    allow_final_symlink=True is a narrowly scoped exception for the FINAL path
+    component only.  It exists for a virtual-environment interpreter launcher
+    (.venv/bin/python -> base interpreter), which is normally a symlink.  Every
+    directory ancestor, any '..' component, and every other symlink component
+    are still refused, so this exception cannot escape confinement or hide a
+    traversal."""
+    raw = Path(str(path))
+    if ".." in raw.parts:
+        raise RuntimeError(f"path contains '..' component: {path}")
+    last = len(raw.parts)
+    for i in range(1, last + 1):
+        if allow_final_symlink and i == last:
+            continue
+        prefix = Path(*raw.parts[:i])
+        try:
+            if prefix.is_symlink():
+                raise RuntimeError(f"symlink component in path (target may be empty): {prefix}")
+        except OSError:
+            pass
+    return None
+
+
+def _reject_symlink_or_overlap(a: Path, b: Path) -> None:
+    ar, br = a.resolve(), b.resolve()
+    if ar == br or ar in br.parents or br in ar.parents:
+        raise RuntimeError(f"paths overlap: {a} and {b}")
+
+
+def _e0_boundaries(cfg: dict[str, Any], lab: Laboratory, require_run_root: bool = True) -> dict[str, str | None]:
+    """Pre-resolution path confinement (R1 / optional-Cantera contract).
+
+    Raw '..' and symlink components (including existing ancestors) are rejected
+    BEFORE canonicalization.  build_root/run_root must not overlap each other,
+    the NRG source, or trusted research_root.  Derived output_root/scratch must
+    remain plain directories under run_root (a symlink is refused even if its
+    target is empty) and must not overlap the input staging area.
+
+    require_run_root=False is the NRG-build case: the build neither reads nor
+    writes any run root, so [e0].run_root is not required and not validated
+    there.  The build must work with no validation/Cantera configuration.
+    """
+    nrg_root = _e0_nrg_root(cfg, lab)
+    build_raw = _e0_raw_path(cfg, "build_root", lab)
+    _reject_raw_symlink_or_dotdot(build_raw)
+    build_root = build_raw.resolve()
+    trusted = lab.research_root.resolve()
+    _reject_symlink_or_overlap(build_root, nrg_root)
+    try:
+        build_root.relative_to(trusted)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(f"[e0].build_root overlaps trusted research_root (lab code / protected results): {build_root}")
+    if not require_run_root:
+        return {"build_root": str(build_root), "run_root": None, "output_root": None, "scratch": None}
+    run_raw = _e0_raw_path(cfg, "run_root", lab)
+    _reject_raw_symlink_or_dotdot(run_raw)
+    run_root = run_raw.resolve()
+    _reject_symlink_or_overlap(build_root, run_root)
+    _reject_symlink_or_overlap(run_root, nrg_root)
+    try:
+        run_root.relative_to(trusted)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(f"[e0].run_root overlaps trusted research_root (lab code / protected results): {run_root}")
+    output_root = run_root / "output"
+    scratch = run_root / "scratch"
+    for derived, name in ((output_root, "output_root"), (scratch, "scratch")):
+        if derived.is_symlink():
+            raise RuntimeError(f"derived {name} is a symlink (refusing even if its target is empty): {derived}")
+        try:
+            derived.resolve().relative_to(run_root)
+        except ValueError:
+            raise RuntimeError(f"derived {name} escapes run_root: {derived}")
+    _reject_symlink_or_overlap(output_root, scratch)
+    return {
+        "build_root": str(build_root),
+        "run_root": str(run_root),
+        "output_root": str(output_root),
+        "scratch": str(scratch),
+    }
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _kill_process_group(proc: "subprocess.Popen[str]") -> None:
+    """SIGKILL the entire process group (session) of proc, then reap it (R3).
+
+    proc was started with start_new_session=True, so its pgid == its pid and all
+    descendants (e.g. the NRG binary launched by the harness) inherit that pgid.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _e0_deadline(cfg: dict[str, Any]) -> float:
+    """Total per-command deadline (R4).  [e0].timeout_seconds is the TOTAL budget
+    for one bridge command (build OR validate), and it must leave a cleanup
+    margin below the bridge timeout so process-group teardown completes before
+    the bridge kills us."""
+    timeout = int(cfg["timeout_seconds"])
+    if timeout + _E0_CLEANUP_MARGIN_S > _E0_BRIDGE_TIMEOUT_S:
+        raise RuntimeError(
+            f"[e0] timeout_seconds ({timeout}) + cleanup margin ({_E0_CLEANUP_MARGIN_S}) "
+            f"exceeds bridge timeout ({_E0_BRIDGE_TIMEOUT_S}); reduce timeout_seconds."
+        )
+    return time.monotonic() + timeout
+
+
+def _e0_remaining(deadline: float) -> int:
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise RuntimeError("total execution deadline exceeded")
+    return int(rem)
+
+
+class _E0Cancellation(RuntimeError):
+    """Cancellation of an E0 child process; never a scientific PASS."""
+
+
+def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path) -> str:
+    """Run fixed argv in a new process group; handle timeout and bridge SIGTERM.
+
+    The SIGTERM handler is a *flag only*.  It is installed in the bridge's
+    main thread before Popen, stays active until teardown completes, and does
+    no subprocess, IO, or signal-group work itself.  communicate() is polled
+    in bounded increments so signal arrival is noticed despite PEP 475
+    interrupted-system-call restarts.  It covers SIGTERM before/during spawn
+    and while collecting output.  SIGKILL cannot be handled here.
+    """
+    if timeout <= 0:
+        raise RuntimeError(f"{label}: nonpositive timeout")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cancelled = {"requested": False, "count": 0}
+
+    def request_cancel(_signum: int, _frame: Any) -> None:
+        cancelled["requested"] = True
+        cancelled["count"] += 1
+
+    try:
+        previous_term = signal.signal(signal.SIGTERM, request_cancel)
+    except ValueError as exc:
+        raise RuntimeError("E0 subprocess wrapper requires the main thread") from exc
+
+    proc: subprocess.Popen[str] | None = None
+    out, err = "", ""
+    outcome = "NOT_STARTED"
+    try:
+        if cancelled["requested"]:
+            raise _E0Cancellation(f"{label} cancelled before launch")
+        # A SIGTERM arriving inside Popen only marks the flag.  Cleanup runs
+        # as soon as Popen returns the new session's process-group identifier.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=_sanitized_env(), start_new_session=True,
+        )
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            if cancelled["requested"]:
+                raise _E0Cancellation(f"{label} cancelled by external SIGTERM")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                out, err = proc.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        # Also reject a SIGTERM that arrived between completion and return.
+        if cancelled["requested"]:
+            raise _E0Cancellation(f"{label} cancelled by external SIGTERM")
+        outcome = f"EXIT_{proc.returncode}"
+        if proc.returncode != 0:
+            raise RuntimeError(f"{label} exited {proc.returncode}; see {log_path}: {err[-2000:]}")
+        return out
+    except BaseException as exc:
+        outcome = "CANCELLED" if cancelled["requested"] or isinstance(exc, _E0Cancellation) else (
+            "TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired) else "FAILED"
+        )
+        if proc is not None:
+            _kill_process_group(proc)
+            try:
+                out, err = proc.communicate(timeout=3)
+            except (subprocess.TimeoutExpired, OSError):
+                # Descendants that escaped the process group cannot be
+                # guaranteed reaped by Python.  No unbounded pipe read here.
+                _kill_process_group(proc)
+                out, err = "", ""
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise RuntimeError(f"{label} timed out after {timeout}s; process group terminated. see {log_path}") from exc
+        raise
+    finally:
+        # Restore before exiting this fixed E0 operation.  A second SIGTERM
+        # during cleanup is recorded by the same flag without recursion.
+        signal.signal(signal.SIGTERM, previous_term)
+        # Logs are written for every outcome, including cancellation before
+        # Popen, never reporting scientific PASS on external cancellation.
+        log_path.write_text(
+            f"# {label}\n# command: {' '.join(cmd)}\n# result: {outcome}"
+            f"\n# cancellation_signals: {cancelled['count']}\n"
+            f"\n== STDOUT ==\n{out}\n\n== STDERR ==\n{err}\n",
+            encoding="utf-8",
+        )
+
+
+def _e0_git_objects(root: Path, commit: str, allowed_prefix: str, source_rel: str) -> dict[str, tuple[str, str]]:
+    """Return {git_path: (mode, oid)} from an *approved commit*, never index.
+
+    Parse git ls-tree -r -z as raw bytes.  Both the requested input prefix and
+    the single V3 source must appear; all paths are normalized UTF-8 and must
+    remain in the approved prefixes.  No shell, checkout, or working-tree reads.
+    """
+    if not (len(commit) == 40 and all(c in "0123456789abcdef" for c in commit.lower())):
+        raise RuntimeError("invalid authorized commit")
+    command = [
+        "git", "-C", str(root), "--no-pager", "--no-optional-locks", "ls-tree",
+        "-r", "-z", commit, "--", allowed_prefix + "/", source_rel,
+    ]
+    try:
+        proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=False, timeout=30, env=_sanitized_env())
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("approved-commit git ls-tree timed out") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"approved-commit git ls-tree failed: {proc.stderr[:500]!r}")
+    raw = proc.stdout
+    if len(raw) > 8 * 1024 * 1024:
+        raise RuntimeError("approved-commit tree inventory exceeds size limit")
+    if not raw or not raw.endswith(b"\0"):
+        raise RuntimeError("empty or malformed approved-commit git tree inventory")
+    entries: dict[str, tuple[str, str]] = {}
+    for item in raw[:-1].split(b"\0"):
+        if b"\t" not in item:
+            raise RuntimeError("invalid NUL-separated git tree entry")
+        meta, raw_path = item.split(b"\t", 1)
+        fields = meta.split(b" ")
+        if len(fields) != 3 or not all(fields) or fields[1] not in (b"blob", b"commit"):
+            raise RuntimeError(f"invalid Git tree metadata: {meta!r}")
+        try:
+            mode, oid, rel = fields[0].decode("ascii"), fields[2].decode("ascii"), raw_path.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("invalid Git tree metadata/path encoding") from exc
+        if (len(oid) not in (40, 64) or any(ch not in "0123456789abcdef" for ch in oid)):
+            raise RuntimeError("invalid git blob OID")
+        if (not rel or rel.startswith("/") or "\\" in rel or "\0" in rel or
+            any(p in ("", ".", "..") for p in rel.split("/"))):
+            raise RuntimeError(f"unsafe Git-tree path: {rel!r}")
+        if not (rel.startswith(allowed_prefix + "/") or rel == source_rel):
+            raise RuntimeError(f"unexpected approved-commit path: {rel}")
+        if rel in entries:
+            raise RuntimeError(f"duplicate approved-commit tree path: {rel}")
+        if mode == "120000":
+            raise RuntimeError(f"symlink in approved commit: {rel}")
+        if mode == "160000" or fields[1] == b"commit":
+            raise RuntimeError(f"gitlink in approved commit: {rel}")
+        if mode not in ("100644", "100755") or fields[1] != b"blob":
+            raise RuntimeError(f"unsupported Git mode/type {mode}: {rel}")
+        entries[rel] = mode, oid
+    if source_rel not in entries:
+        raise RuntimeError(f"approved commit is missing V3 source: {source_rel}")
+    if not any(path.startswith(allowed_prefix + "/") for path in entries):
+        raise RuntimeError("approved commit contains no task_setup data")
+    return entries
+
+
+def _e0_read_git_blob(root: Path, oid: str, *, max_bytes: int = 64 * 1024 * 1024) -> bytes:
+    """Retrieve approved Git blob bytes with a bounded fixed-argv subprocess.
+
+    Independently check Git's content-addressed blob OID (SHA-1 or SHA-256).
+    This is in addition to the SHA-256 content manifest below.
+    """
+    # Preflight exact Git object size before allocating the binary stdout pipe.
+    # Git content-addresses the blob OID; reject oversized input before read.
+    try:
+        size_proc = subprocess.run(
+            ["git", "-C", str(root), "--no-pager", "--no-optional-locks", "cat-file", "-s", oid],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"approved Git blob {oid} size probe timed out") from exc
+    if size_proc.returncode != 0:
+        raise RuntimeError(f"approved Git blob {oid} unavailable (size probe)")
+    try:
+        object_size = int(size_proc.stdout.decode("ascii").strip())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("invalid approved Git blob size") from exc
+    if object_size < 0 or object_size > max_bytes:
+        raise RuntimeError(f"approved Git blob {oid} exceeds size limit")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "--no-pager", "--no-optional-locks", "cat-file", "blob", oid],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"approved Git blob {oid} read timed out") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(f"approved Git blob {oid} unavailable: {proc.stderr[:500]!r}")
+    data = proc.stdout
+    if len(data) != object_size or len(data) > max_bytes:
+        raise RuntimeError(f"approved Git blob {oid} size changed or exceeds limit")
+    header = f"blob {len(data)}\0".encode("ascii")
+    digest = hashlib.sha1(header + data).hexdigest() if len(oid) == 40 else hashlib.sha256(header + data).hexdigest()
+    if digest != oid:
+        raise RuntimeError(f"approved Git blob/OID mismatch: {oid}")
+    return data
+
+
+def _e0_stage_task_setup(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory, scratch: Path) -> dict[str, Any]:
+    """Stage approved-commit Git blobs into an isolated scratch task_setup tree.
+
+    Neither the index nor the working tree can change authorized file bytes.
+    The complete pinned-tree inventory is the authorized file set.  Hashes
+    of staged output are independently verified and recorded with Git OIDs.
+    """
+    root = _e0_nrg_root(cfg, lab)
+    commit = auth["commit"]
+    inventory = _e0_git_objects(root, commit, _E0_TASK_SETUP_REL, _E0_SOURCE_REL)
+    prefix = _E0_TASK_SETUP_REL + "/"
+    task_files = {p for p in inventory if p.startswith(prefix)}
+    required = {f"{prefix}chemical_mechanisms/{rel}" for rel in _E0_SIX_MECHANISMS}
+    missing = sorted(required - task_files)
+    if missing:
+        raise RuntimeError("six-mechanism manifest incomplete in approved commit: " + "; ".join(missing))
+    if not any(p.startswith(prefix + "thermophysical_data/") for p in task_files):
+        raise RuntimeError("thermophysical_data missing in approved commit")
+    staged: dict[str, str] = {}
+    records: list[dict[str, str]] = []
+    blobs: dict[str, bytes] = {}
+    total = 0
+    for rel, (mode, oid) in sorted(inventory.items()):
+        data = _e0_read_git_blob(root, oid)
+        total += len(data)
+        if total > 256 * 1024 * 1024:
+            raise RuntimeError("approved input tree exceeds 256 MiB staging limit")
+        digest = hashlib.sha256(data).hexdigest()
+        if rel == _E0_SOURCE_REL:
+            if digest != auth["source_sha256"]:
+                raise RuntimeError("approved V3 source SHA-256 mismatch")
+            if _V3_MARKER.encode("utf-8") not in data:
+                raise RuntimeError("approved V3 source marker missing")
+        blobs[rel] = data
+        records.append({"repository_path": rel, "git_mode": mode, "git_blob_oid": oid,
+                        "sha256": digest, "staged_path": rel})
+    # Build a deterministic manifest before changing scratch, then stage only
+    # authenticated bytes.  All paths in records were validated above.
+    manifest_data: dict[str, Any] = {"schema_version": 1, "approved_commit": commit, "files": records}
+    manifest_bytes = (json.dumps(manifest_data, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    if scratch.exists():
+        raise RuntimeError(f"scratch staging root exists: {scratch}")
+    scratch.mkdir(parents=True, exist_ok=False)
+    for rel, data in sorted(blobs.items()):
+        dst = scratch / rel
+        _ensure_within(dst, scratch)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        if sha256_file(dst) != digest:
+            raise RuntimeError(f"approved Git blob staging mismatch: {rel}")
+        staged[rel] = digest
+    manifest_path = scratch / "staged_input_manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    if sha256_file(manifest_path) != manifest_sha:
+        raise RuntimeError("staged-input manifest write integrity failure")
+    return {"staged_files": staged, "scratch": str(scratch),
+            "staged_input_manifest": str(manifest_path), "staged_input_manifest_sha256": manifest_sha,
+            "approved_commit": commit}
+
+
+def _e0_exe_path(cfg: dict[str, Any], lab: Laboratory) -> Path:
+    return _e0_path(cfg, "build_root", lab) / "bin" / cfg["build_type"].title() / cfg["equilibrium_executable"]
+
+
+class _E0ReferenceNotConfigured(RuntimeError):
+    """The OPTIONAL Cantera reference is not configured.
+
+    This is an optional reference-verification status, not a generic laboratory
+    failure, not an NRG build failure, and never a scientific PASS or FAIL of
+    NRG itself.  It subclasses RuntimeError so existing fail-closed callers and
+    tests keep working."""
+
+    status = _E0_REFERENCE_NOT_CONFIGURED
+
+
+def _e0_python_launcher_identity(cfg: dict[str, Any], lab: Laboratory) -> dict[str, Any]:
+    """Fingerprint a Cantera-capable interpreter WITHOUT losing venv identity.
+
+    The configured value is the *launcher* path (e.g. .venv/bin/python).  That
+    path is preserved verbatim as the execution argv[0], because a venv
+    launcher is normally a symlink to a base interpreter and canonicalizing it
+    to the base interpreter path silently discards the venv (pyvenv.cfg), i.e.
+    it would lose the environment Cantera was installed into.  Only the FINAL
+    path component may be a symlink; ancestors, '..', and every other symlink
+    component are still refused by _reject_raw_symlink_or_dotdot.
+
+    Returns the launcher path, the resolved target, the target binary SHA-256,
+    and (when present) the adjacent venv identity: venv root, pyvenv.cfg path,
+    and pyvenv.cfg SHA-256.  Does NOT import or execute Cantera.
+    """
+    raw = _e0_raw_path(cfg, "cantera_python", lab)
+    _reject_raw_symlink_or_dotdot(raw, allow_final_symlink=True)
+    launcher = Path(os.path.abspath(raw))
+    if not launcher.exists():
+        raise _E0ReferenceNotConfigured(f"cantera_python missing: {launcher}")
+    target = launcher.resolve(strict=True)
+    if not target.is_file():
+        raise _E0ReferenceNotConfigured(f"cantera_python launcher target is not a regular file: {target}")
+    pyvenv_cfg = launcher.parent.parent / "pyvenv.cfg"
+    if pyvenv_cfg.is_symlink():
+        raise RuntimeError(f"pyvenv.cfg is a symlink (refusing): {pyvenv_cfg}")
+    is_venv = pyvenv_cfg.is_file()
+    return {
+        "cantera_python": str(launcher),
+        "cantera_python_resolved": str(target),
+        "cantera_python_sha256": sha256_file(target),
+        "cantera_python_launcher_is_symlink": launcher.is_symlink(),
+        "cantera_venv_root": str(launcher.parent.parent) if is_venv else None,
+        "cantera_pyvenv_cfg": str(pyvenv_cfg) if is_venv else None,
+        "cantera_pyvenv_cfg_sha256": sha256_file(pyvenv_cfg) if is_venv else None,
+        "cantera_is_venv": is_venv,
+    }
+
+
+def _e0_python_identity(cfg: dict[str, Any], lab: Laboratory) -> tuple[Path, str]:
+    """Backwards-compatible (launcher_path, binary_sha256) pair.
+
+    The launcher path is returned as-is (see _e0_python_launcher_identity); the
+    hash is of the resolved interpreter binary."""
+    rec = _e0_python_launcher_identity(cfg, lab)
+    return Path(rec["cantera_python"]), rec["cantera_python_sha256"]
+
+
+def _e0_reference_status(rec: dict[str, Any], probe: bool = False) -> dict[str, Any]:
+    """Report the OPTIONAL Cantera reference status for a launcher record.
+
+    Default (probe=False) never imports Cantera: status REFERENCE_UNVERIFIED,
+    and the reviewed harness performs its own availability check when it runs.
+    probe=True is an explicit, operator-authorized availability probe (import
+    only, version/location printed) that yields REFERENCE_AVAILABLE or
+    CANTERA_UNAVAILABLE.
+
+    These statuses describe the optional independent reference.  They are never
+    generic-laboratory readiness, never NRG build readiness, and never a
+    scientific PASS or FAIL of NRG itself.
+    """
+    out: dict[str, Any] = {
+        "optional_reference": True,
+        "reference_engine": "cantera",
+        "reference_status": _E0_REFERENCE_UNVERIFIED,
+        "reference_detail": "availability probe not requested; no Cantera import performed",
+        **rec,
+    }
+    if not probe:
+        return out
+    if not os.access(rec["cantera_python"], os.X_OK):
+        out["reference_status"] = _E0_CANTERA_UNAVAILABLE
+        out["reference_detail"] = f"interpreter launcher is not executable: {rec['cantera_python']}"
+        return out
+    try:
+        proc = subprocess.run(
+            [rec["cantera_python"], "-c", _E0_CANTERA_PROBE],
+            capture_output=True, text=True, timeout=_E0_REFERENCE_PROBE_TIMEOUT_S, env=_sanitized_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        out["reference_status"] = _E0_CANTERA_UNAVAILABLE
+        out["reference_detail"] = f"probe failed to start: {type(exc).__name__}: {exc}"
+        return out
+    lines = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip().splitlines()
+        out["reference_status"] = _E0_CANTERA_UNAVAILABLE
+        out["reference_detail"] = f"probe exited {proc.returncode}: {err[-1] if err else 'no stderr'}"
+        return out
+    out["reference_status"] = _E0_REFERENCE_AVAILABLE
+    out["cantera_version"] = lines[0] if lines else None
+    out["cantera_module"] = lines[1] if len(lines) > 1 else None
+    out["reference_detail"] = "Cantera import probe succeeded"
+    return out
+
+
+def _e0_bind_reference_identity(interp: dict[str, Any], args: argparse.Namespace) -> None:
+    """Fail closed unless the plan-time optional-reference identity is unchanged.
+
+    Binding covers the launcher path (venv identity), the resolved interpreter
+    binary, and - inside a virtual environment - the pyvenv.cfg identity.  A
+    changed launcher, binary, or venv identity is refused, and so is a plan that
+    promised a venv when the launcher is not inside one."""
+    expected_launcher = getattr(args, "expected_cantera_python_launcher", None)
+    expected_pyvenv = getattr(args, "expected_cantera_pyvenv_sha256", None)
+    if not getattr(args, "expected_cantera_python_sha256", None):
+        raise RuntimeError("plan->execute binding requires --expected-cantera-python-sha256")
+    if not expected_launcher:
+        raise RuntimeError("plan->execute binding requires --expected-cantera-python-launcher (vetted interpreter launcher path)")
+    if args.expected_cantera_python_sha256 != interp["cantera_python_sha256"]:
+        raise RuntimeError("cantera_python interpreter binary changed since plan")
+    if expected_launcher != interp["cantera_python"]:
+        raise RuntimeError("cantera_python launcher path changed since plan")
+    if interp["cantera_is_venv"]:
+        if not expected_pyvenv:
+            raise RuntimeError("plan->execute binding requires --expected-cantera-pyvenv-sha256 when the launcher is inside a virtual environment")
+        if expected_pyvenv != interp["cantera_pyvenv_cfg_sha256"]:
+            raise RuntimeError("cantera virtual-environment identity (pyvenv.cfg) changed since plan")
+    elif expected_pyvenv:
+        raise RuntimeError("plan promised a virtual environment but the launcher is not inside one")
+    return None
+
+
+def _e0_read_state(case_dir: Path, mode: str) -> list[tuple[str, float]]:
+    path = case_dir / f"nrg_{mode}_{mode}_state.csv"
+    if not path.is_file():
+        raise RuntimeError(f"missing state CSV: {path}")
+    rows = _read_csv(path)
+    if not rows:
+        raise RuntimeError(f"empty state CSV: {path}")
+    if "species" not in rows[0] or "mole_fraction" not in rows[0]:
+        raise RuntimeError(f"state CSV missing species/mole_fraction columns: {path}")
+    seen: set[str] = set()
+    out: list[tuple[str, float]] = []
+    for r in rows:
+        name = (r.get("species") or "").strip()
+        if not name:
+            raise RuntimeError(f"state CSV has empty species name: {path}")
+        if name in seen:
+            raise RuntimeError(f"state CSV has duplicate species {name!r}: {path}")
+        seen.add(name)
+        try:
+            x = float(r["mole_fraction"])
+        except (KeyError, ValueError):
+            raise RuntimeError(f"malformed mole_fraction for species {name!r} in {path}")
+        if not _isfinite(x):
+            raise RuntimeError(f"non-finite mole_fraction for species {name!r} in {path}")
+        out.append((name, x))
+    return out
+
+
+def _e0_read_diagnostics(case_dir: Path, mode: str) -> dict[str, Any]:
+    path = case_dir / f"nrg_{mode}_{mode}_diagnostics.csv"
+    if not path.is_file():
+        raise RuntimeError(f"missing diagnostics CSV: {path}")
+    rows = _read_csv(path)
+    if not rows:
+        raise RuntimeError(f"empty diagnostics CSV: {path}")
+    if list(rows[0].keys()) != ["key", "value"]:
+        raise RuntimeError(f"diagnostics CSV must have exactly columns [key, value]: {path}")
+    diag: dict[str, Any] = {}
+    for r in rows:
+        if set(r.keys()) != {"key", "value"}:
+            raise RuntimeError(f"diagnostics CSV has duplicate/unknown columns: {path}")
+        k = (r.get("key") or "").strip()
+        v = (r.get("value") or "").strip()
+        if not k:
+            raise RuntimeError(f"malformed diagnostics record (empty key) in {path}")
+        if k in diag:
+            raise RuntimeError(f"duplicate diagnostics key {k!r} in {path}")
+        if k == "converged":
+            diag[k] = v
+            continue
+        try:
+            val = float(v)
+        except ValueError:
+            raise RuntimeError(f"malformed numeric value for key {k!r} in {path}")
+        if not _isfinite(val):
+            raise RuntimeError(f"non-finite diagnostics value for {k!r} in {path}")
+        diag[k] = val
+    missing = [k for k in _E0_DIAGNOSTICS_KEYS if k not in diag]
+    if missing:
+        raise RuntimeError(f"diagnostics CSV missing required keys {sorted(missing)}: {path}")
+    for k in _E0_RESIDUAL_KEYS:
+        if k in diag and float(diag[k]) < 0.0:
+            raise RuntimeError(f"negative {k} {diag[k]} in {path}")
+    if float(diag["temperature_K"]) <= 0.0:
+        raise RuntimeError(f"nonphysical temperature_K {diag['temperature_K']} in {path}")
+    if float(diag["pressure_Pa"]) <= 0.0:
+        raise RuntimeError(f"nonphysical pressure_Pa {diag['pressure_Pa']} in {path}")
+    return diag
+
+
+def _e0_independent_checks(result: dict[str, Any], acceptance: dict[str, float], case_dir: Path) -> list[str]:
+    """Independent acceptance on raw archived CSVs, decoupled from the harness
+    screening verdict.  Acceptance keys are guaranteed present and validated by
+    _e0_authorization; no default threshold is inserted here.
+
+    Evidence classes (R5):
+      * RECOMPUTED -- mole-fraction normalization and nonnegativity are recomputed
+        here from the raw state CSV (genuinely independent of NRG's own report).
+      * INSPECTED -- element/mass/enthalpy conservation residuals and temperature/
+        pressure are read back from NRG-generated diagnostics and cross-checked
+        against result.json.  These are NOT an independent conservation re-
+        derivation, only an inspection of NRG's reported residuals.
+
+    Mandatory finite JSON checks (R4): nrg_temperature_K, nrg_diagnostics (each
+    expected numeric residual), and the full comparison error fields (converged,
+    max_absolute_mole_fraction_error, temperature_error_K) are all required;
+    missing/NaN/Inf/wrong-type/mismatch/nonphysical-sign fail closed.
+    """
+    issues: list[str] = []
+    if result.get("validation_mode") != "full":
+        return ["not full validation mode"]
+    eq = result.get("comparisons", {}).get("equilibrium", {})
+    if not isinstance(eq, dict) or not eq:
+        return ["missing comparisons.equilibrium in result.json"]
+    tp_species = {s for s, _ in _e0_read_state(case_dir, "tp")}
+    hp_species = {s for s, _ in _e0_read_state(case_dir, "hp")}
+    if tp_species != hp_species:
+        issues.append("TP/HP species set mismatch")
+    for mode in ("tp", "hp"):
+        m = eq.get(mode, {})
+        if not isinstance(m, dict):
+            issues.append(f"{mode}: missing comparison block in result.json")
+            continue
+        state = _e0_read_state(case_dir, mode)
+        diag = _e0_read_diagnostics(case_dir, mode)
+        conv = str(diag.get("converged", "F")).strip().upper() in ("T", "TRUE", ".TRUE.")
+        if not conv or not m.get("converged"):
+            issues.append(f"{mode}: did not converge")
+            continue
+        xs = [x for _, x in state]
+        s = sum(xs)
+        # RECOMPUTED (R5): normalization + nonnegativity from the raw state CSV.
+        if abs(s - 1.0) > acceptance["normalization_tolerance"]:
+            issues.append(f"{mode}: mole fractions not normalized (sum={s:.3e}) [recomputed from state CSV]")
+        if min(xs) < -acceptance["nonnegativity_tolerance"]:
+            issues.append(f"{mode}: negative mole fraction {min(xs):.3e} [recomputed from state CSV]")
+        # INSPECTED (R5): NRG-reported residuals read back, NOT recomputed.
+        for rk, tol_key in _E0_RESIDUAL_TOL.items():
+            if float(diag[rk]) > acceptance[tol_key]:
+                issues.append(f"{mode}: NRG-reported {rk} {diag[rk]:.3e} exceeds tolerance [inspected, not recomputed]")
+        # Mandatory nrg_temperature_K (R4): finite and positive.
+        nrg_T = m.get("nrg_temperature_K")
+        if nrg_T is None:
+            issues.append(f"{mode}: missing nrg_temperature_K in result.json")
+            continue
+        try:
+            fT = float(nrg_T)
+        except (TypeError, ValueError):
+            issues.append(f"{mode}: non-numeric nrg_temperature_K in result.json")
+            continue
+        if not _isfinite(fT) or fT <= 0.0:
+            issues.append(f"{mode}: nrg_temperature_K must be finite and positive (got {nrg_T})")
+            continue
+        if abs(float(diag["temperature_K"]) - fT) > max(1e-12, abs(fT) * 1e-9):
+            issues.append(f"{mode}: temperature_K CSV/result.json mismatch ({diag['temperature_K']} vs {fT})")
+        # Fixed 1-atm pilot constraint.
+        if abs(float(diag["pressure_Pa"]) - _E0_EXPECTED_PRESSURE_PA) > _E0_EXPECTED_PRESSURE_PA * 1e-9:
+            issues.append(f"{mode}: unexpected pressure {diag['pressure_Pa']} (expected {_E0_EXPECTED_PRESSURE_PA})")
+        # Mandatory nrg_diagnostics (R4): require the dict and each expected
+        # numeric residual, finite and nonnegative, cross-checked against the CSV.
+        nrg_diag = m.get("nrg_diagnostics")
+        if not isinstance(nrg_diag, dict):
+            issues.append(f"{mode}: missing/invalid nrg_diagnostics in result.json")
+            continue
+        for rk in _E0_RESIDUAL_KEYS:
+            dv = nrg_diag.get(rk)
+            if dv is None:
+                issues.append(f"{mode}: missing nrg_diagnostics.{rk} in result.json")
+                continue
+            try:
+                fdv = float(dv)
+            except (TypeError, ValueError):
+                issues.append(f"{mode}: non-numeric nrg_diagnostics.{rk} in result.json")
+                continue
+            if not _isfinite(fdv) or fdv < 0.0:
+                issues.append(f"{mode}: nrg_diagnostics.{rk} must be finite and nonnegative (got {dv})")
+                continue
+            if abs(float(diag[rk]) - fdv) > max(1e-15, abs(fdv) * 1e-9):
+                issues.append(f"{mode}: diagnostics {rk} CSV/result.json mismatch ({diag[rk]:.3e} vs {fdv:.3e})")
+        # Mandatory full comparison error fields (R4).
+        for key, tol_key, label in (
+            ("max_absolute_mole_fraction_error", "mole_fraction_tolerance", "mole-fraction delta vs Cantera"),
+            ("temperature_error_K", "temperature_tolerance_K", "temperature delta vs Cantera"),
+        ):
+            v = m.get(key)
+            if v is None:
+                issues.append(f"{mode}: missing {key} in result.json")
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                issues.append(f"{mode}: non-numeric {key} in result.json")
+                continue
+            if not _isfinite(fv):
+                issues.append(f"{mode}: {key} must be finite (NaN/Inf rejected)")
+                continue
+            if fv < 0.0:
+                issues.append(f"{mode}: {key} must be nonnegative (got {fv})")
+                continue
+            if fv > acceptance[tol_key]:
+                issues.append(f"{mode}: {label} exceeds tolerance ({fv:.3e} > {acceptance[tol_key]:.3e})")
+    return issues
+
+
+def _e0_parse_results(output_root: Path, selector: str) -> dict[str, Any]:
+    summary_path = output_root / "summary.json"
+    if not summary_path.is_file():
+        raise RuntimeError(f"missing summary.json: {summary_path}")
+    summary = read_json(summary_path)
+    if not isinstance(summary, list) or not summary:
+        raise RuntimeError("summary.json is empty or malformed")
+    non_dict = [i for i, r in enumerate(summary) if not isinstance(r, dict)]
+    if non_dict:
+        raise RuntimeError(f"summary.json contains non-dictionary records at indices {non_dict}")
+    matching = [r for r in summary if r.get("mechanism") == selector]
+    if not matching:
+        raise RuntimeError(f"selected mechanism {selector} missing from summary.json")
+    if len(matching) > 1:
+        raise RuntimeError(f"summary.json has {len(matching)} duplicate records for {selector} (expected exactly one)")
+    extra = sorted({r.get("mechanism") for r in summary if r.get("mechanism") != selector})
+    if extra:
+        raise RuntimeError(f"summary.json contains unexpected mechanism records {extra} (expected only {selector})")
+    target = matching[0]
+    mech_stem = Path(selector).stem
+    case_dirs = sorted(
+        d for d in output_root.iterdir()
+        if d.is_dir() and d.name.endswith(f"_{mech_stem}") and (d / "result.json").is_file()
+    )
+    if not case_dirs:
+        raise RuntimeError(f"case result.json missing for {selector}")
+    if len(case_dirs) > 1:
+        raise RuntimeError(f"multiple case directories for {selector}: {[d.name for d in case_dirs]}")
+    case_dir = case_dirs[0]
+    result = read_json(case_dir / "result.json")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"case result.json malformed for {selector}")
+    # Reject summary/case status and mechanism mismatch (correction 7).
+    if target.get("status") != result.get("status"):
+        raise RuntimeError(f"summary/case status mismatch for {selector}: {target.get('status')} vs {result.get('status')}")
+    if result.get("mechanism") not in (None, selector):
+        raise RuntimeError(f"case result.json mechanism mismatch for {selector}: {result.get('mechanism')}")
+    # Complete TP/HP results required (validation-config/data-completeness round).
+    eq = result.get("comparisons", {}).get("equilibrium", {})
+    for mode in ("tp", "hp"):
+        if not isinstance(eq.get(mode), dict):
+            raise RuntimeError(f"case result.json missing equilibrium.{mode} comparison block for {selector}")
+    return {"summary_entry": target, "result": result, "case_dir": case_dir}
+
+
+def _e0_verify_build_identity(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory, preflight: dict[str, Any], exe_path: Path, exe_sha: str) -> dict[str, Any]:
+    """Correction 1: reject a build-manifest/binary pair that is self-consistent
+    but not associated with the researcher-approved source."""
+    manifest_path = _e0_path(cfg, "build_root", lab) / "build_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"build_manifest.json missing: {manifest_path}")
+    manifest = read_json(manifest_path)
+    checks = (
+        ("pinned_commit", manifest.get("pinned_commit"), auth["commit"]),
+        ("pinned_source_sha256", manifest.get("pinned_source_sha256"), preflight["source_sha256"]),
+        ("cmake_selector", manifest.get("cmake_selector"), _E0_CMAKE_SELECTOR),
+        ("cmake_target", manifest.get("cmake_target"), _E0_CMAKE_TARGET),
+        ("source_relative", manifest.get("source_relative"), _E0_SOURCE_REL),
+        ("build_type", manifest.get("build_type"), cfg["build_type"]),
+        ("executable_sha256", manifest.get("executable_sha256"), exe_sha),
+    )
+    for key, got, want in checks:
+        if got != want:
+            raise RuntimeError(f"build_manifest.json {key}={got!r} != approved {want!r}; manifest/binary not associated with approved source.")
+    recorded_path = manifest.get("executable_path")
+    if recorded_path is not None and Path(recorded_path).resolve() != exe_path.resolve():
+        raise RuntimeError(f"build_manifest.json executable_path {recorded_path} != pinned executable {exe_path}")
+    return manifest
+
+
+def _e0_validation_config(harness_path: Path, auth: dict[str, Any]) -> Path:
+    """Resolve and authenticate validation_config.json (validation-config pin).
+
+    The harness (tools/run_validation.py) reads its validation_config.json one
+    directory above the tools/ directory (harness_path.parent.parent).  That
+    accepted location is fixed by _E0_CONFIG_REL, and the file's SHA-256 is
+    pinned in the protected authorization record (validation_config_sha256).
+    Both are verified here so a stray, tampered, symlinked, or hash-mismatched
+    config cannot steer the run.  Reject absent/malformed/mismatch and return
+    the canonical resolved path."""
+    config_path = harness_path.parent.parent / _E0_CONFIG_REL
+    if config_path.is_symlink():
+        raise RuntimeError(f"validation_config.json is a symlink (refusing): {config_path}")
+    if not config_path.is_file():
+        raise RuntimeError(f"validation_config.json missing at accepted location: {config_path}")
+    if sha256_file(config_path) != auth["validation_config_sha256"]:
+        raise RuntimeError("validation_config.json SHA-256 does not match authorized validation_config_sha256; source review required.")
+    return config_path
+
+
+def _e0_validation_config_snapshot(harness_path: Path, auth: dict[str, Any], scratch: Path) -> Path:
+    """Run-owned, hash-verified snapshot of validation_config.json (correction 2).
+
+    The harness reads a COPY staged under the run-owned scratch root, not the
+    live file, so a config swapped after the plan/execute hash check cannot steer
+    the run.  The source is authenticated against the protected pin, and the
+    snapshot is re-hashed to confirm a byte-identical write."""
+    src = _e0_validation_config(harness_path, auth)
+    snap = scratch / "validation_config.snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_bytes(src.read_bytes())
+    if sha256_file(snap) != auth["validation_config_sha256"]:
+        raise RuntimeError("validation_config.json snapshot hash mismatch (write integrity failed)")
+    return snap
+
+
+def cmd_e0_build_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="build")
+        auth = _e0_authorization(lab)
+        pre = _e0_checkout_preflight(cfg, auth, lab)
+        _e0_boundaries(cfg, lab, require_run_root=False)
+        compiler, version = _e0_discover_fortran()
+        cmake_ver = subprocess.run(["cmake", "--version"], capture_output=True, text=True, env=_sanitized_env()).stdout.strip().splitlines()
+        return emit({
+            "can_build": True,
+            # The NRG build never queries, hashes, or imports a Cantera
+            # environment: Cantera is an optional independent reference used
+            # only by the separate equilibrium-validation command.
+            "cantera_required": False,
+            "reference_dependency": "not_required_for_build",
+            "commit": pre["commit"],
+            "source_sha256": pre["source_sha256"],
+            "source_path": pre["source_path"],
+            "fortran_compiler": compiler,
+            "fortran_version": version,
+            "cmake_version": cmake_ver[0] if cmake_ver else "unknown",
+            "build_type": cfg["build_type"],
+            "build_root": str(_e0_path(cfg, "build_root", lab)),
+            "nrg_source_root": str(_e0_nrg_root(cfg, lab)),
+            "cmake_selector": _E0_CMAKE_SELECTOR,
+            "cmake_target": _E0_CMAKE_TARGET,
+            "executable_name": cfg["equilibrium_executable"],
+        })
+    except Exception as exc:
+        return emit({"error": f"{type(exc).__name__}: {exc}", "can_build": False}, 2)
+
+
+def cmd_e0_build_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="build")
+        auth = _e0_authorization(lab)
+        pre = _e0_checkout_preflight(cfg, auth, lab)
+        _e0_boundaries(cfg, lab, require_run_root=False)
+        # Mandatory plan->execute binding (correction 6): identity fields are
+        # required, not optional.
+        if not args.expected_source_sha256 or not args.expected_commit:
+            raise RuntimeError("plan->execute binding requires --expected-source-sha256 and --expected-commit; refusing to build without plan identity.")
+        if args.expected_source_sha256 != pre["source_sha256"]:
+            raise RuntimeError("source SHA-256 changed since plan; researcher review required.")
+        if args.expected_commit != pre["commit"]:
+            raise RuntimeError("checkout commit changed since plan; researcher review required.")
+        compiler, cver = _e0_discover_fortran()
+        root = _e0_nrg_root(cfg, lab)
+        build_root = _e0_path(cfg, "build_root", lab)
+        if build_root.exists() and any(build_root.iterdir()):
+            raise RuntimeError(f"build_root already exists and is nonempty: {build_root}")
+        build_root.mkdir(parents=True, exist_ok=True)
+        jobs = int(cfg["parallel_jobs"])
+        deadline = _e0_deadline(cfg)
+        build_type = cfg["build_type"]
+        cmake_ver = subprocess.run(["cmake", "--version"], capture_output=True, text=True, env=_sanitized_env()).stdout.strip().splitlines()
+        configure_cmd = [
+            "cmake", "-S", str(root), "-B", str(build_root),
+            f"-DPACKAGE_INTERFACE_SOURCE={_E0_CMAKE_SELECTOR}",
+            f"-DCMAKE_BUILD_TYPE={build_type.title()}",
+            f"-DCMAKE_Fortran_COMPILER={compiler}",
+        ]
+        _run_bounded(configure_cmd, "cmake configure", _e0_remaining(deadline), build_root / "cmake_configure.log")
+        build_cmd = ["cmake", "--build", str(build_root), "--target", _E0_CMAKE_TARGET, "--parallel", str(jobs)]
+        _run_bounded(build_cmd, "cmake build", _e0_remaining(deadline), build_root / "cmake_build.log")
+        exe_path = _e0_exe_path(cfg, lab)
+        if not exe_path.is_file():
+            raise RuntimeError(f"build produced no executable at {exe_path}")
+        exe_sha = sha256_file(exe_path)
+        manifest = {
+            "pinned_commit": auth["commit"],
+            "pinned_source_sha256": pre["source_sha256"],
+            "source_relative": _E0_SOURCE_REL,
+            "cmake_selector": _E0_CMAKE_SELECTOR,
+            "cmake_target": _E0_CMAKE_TARGET,
+            "configure_command": configure_cmd,
+            "configure_log": str(build_root / "cmake_configure.log"),
+            "build_log": str(build_root / "cmake_build.log"),
+            "executable_sha256": exe_sha,
+            "executable_path": str(exe_path),
+            "build_type": build_type,
+            "fortran_compiler": compiler,
+            "fortran_version": cver,
+            "cmake_version": cmake_ver[0] if cmake_ver else "unknown",
+            "built_at": utc_now(),
+        }
+        write_json(build_root / "build_manifest.json", manifest)
+        return emit({"built": True, "executable_sha256": exe_sha, "build_manifest": manifest, "build_root": str(build_root)})
+    except Exception as exc:
+        return emit({"error": f"{type(exc).__name__}: {exc}", "built": False}, 2)
+
+
+def cmd_e0_validate_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="validation")
+        auth = _e0_authorization(lab)
+        _e0_boundaries(cfg, lab)
+        pre = _e0_checkout_preflight(cfg, auth, lab)
+        harness_path = _e0_path(cfg, "harness", lab)
+        if not harness_path.is_file():
+            raise RuntimeError(f"harness missing: {harness_path}")
+        harness_sha = sha256_file(harness_path)
+        if harness_sha != auth["harness_sha256"]:
+            raise RuntimeError("harness SHA-256 does not match authorized harness_sha256 (post-patch hash); source review required.")
+        exe_path = _e0_exe_path(cfg, lab)
+        if not exe_path.is_file():
+            raise RuntimeError(f"equilibrium executable missing: {exe_path}")
+        exe_sha = sha256_file(exe_path)
+        _e0_verify_build_identity(cfg, auth, lab, pre, exe_path, exe_sha)
+        _e0_validation_config(harness_path, auth)
+        interp = _e0_python_launcher_identity(cfg, lab)
+        # Optional independent reference: the probe is opt-in and performed only
+        # when explicitly requested, so planning never imports Cantera.
+        ref = _e0_reference_status(interp, probe=bool(getattr(args, "probe_cantera_reference", False)))
+        if ref["reference_status"] == _E0_CANTERA_UNAVAILABLE:
+            return emit({
+                "can_run": False,
+                "generic_lab_ready": True,
+                "scientific_pass": False,
+                "verification_mode": "full",
+                "reference_required_for_this_command": True,
+                "error": f"{_E0_CANTERA_UNAVAILABLE}: {ref['reference_detail']}",
+                **ref,
+            }, 3)
+        return emit({
+            "can_run": True,
+            "verification_mode": "full",
+            "reference_required_for_this_command": True,
+            "mechanism_selector": _E0_MECHANISM_SELECTOR,
+            "commit": pre["commit"],
+            "source_sha256": pre["source_sha256"],
+            "executable_sha256": exe_sha,
+            "harness_sha256": harness_sha,
+            "validation_config_sha256": auth["validation_config_sha256"],
+            "cantera_python": interp["cantera_python"],
+            "cantera_python_resolved": interp["cantera_python_resolved"],
+            "cantera_python_sha256": interp["cantera_python_sha256"],
+            "cantera_is_venv": interp["cantera_is_venv"],
+            "cantera_venv_root": interp["cantera_venv_root"],
+            "cantera_pyvenv_cfg_sha256": interp["cantera_pyvenv_cfg_sha256"],
+            "output_root": str(_e0_path(cfg, "run_root", lab) / "output"),
+            **ref,
+        })
+    except _E0ReferenceNotConfigured as exc:
+        return emit({
+            "can_run": False,
+            "generic_lab_ready": True,
+            "scientific_pass": False,
+            "verification_mode": "full",
+            "reference_required_for_this_command": True,
+            "optional_reference": True,
+            "reference_engine": "cantera",
+            "reference_status": _E0_REFERENCE_NOT_CONFIGURED,
+            "reference_detail": str(exc),
+            "error": f"{_E0_REFERENCE_NOT_CONFIGURED}: {type(exc).__name__}: {exc}",
+        }, 3)
+    except Exception as exc:
+        return emit({"error": f"{type(exc).__name__}: {exc}", "can_run": False}, 2)
+
+
+def cmd_e0_validate_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="validation")
+        auth = _e0_authorization(lab)
+        selector = _E0_MECHANISM_SELECTOR
+        _e0_boundaries(cfg, lab)
+        pre = _e0_checkout_preflight(cfg, auth, lab)
+        exe_path = _e0_exe_path(cfg, lab)
+        if not exe_path.is_file():
+            raise RuntimeError(f"equilibrium executable missing: {exe_path}")
+        exe_sha = sha256_file(exe_path)
+        harness_path = _e0_path(cfg, "harness", lab)
+        harness_sha = sha256_file(harness_path)
+        if harness_sha != auth["harness_sha256"]:
+            raise RuntimeError("harness SHA-256 does not match authorized harness_sha256 (post-patch hash)")
+        # Mandatory plan->execute binding (correction 6).
+        if not args.expected_executable_sha256 or not args.expected_harness_sha256:
+            raise RuntimeError("plan->execute binding requires --expected-executable-sha256 and --expected-harness-sha256.")
+        if args.expected_executable_sha256 != exe_sha:
+            raise RuntimeError("executable SHA-256 changed since plan")
+        if args.expected_harness_sha256 != harness_sha:
+            raise RuntimeError("harness SHA-256 changed since plan")
+        _e0_verify_build_identity(cfg, auth, lab, pre, exe_path, exe_sha)
+        # Correction 2: bind validation_config plan->execute, then run from a
+        # run-owned snapshot (not the live file) so a config swapped after this
+        # check cannot steer the run.
+        if not args.expected_validation_config_sha256:
+            raise RuntimeError("plan->execute binding requires --expected-validation-config-sha256")
+        if args.expected_validation_config_sha256 != auth["validation_config_sha256"]:
+            raise RuntimeError("validation_config SHA-256 changed since plan")
+        # Correction 3 + optional-reference contract: bind the interpreter
+        # LAUNCHER path (so a venv keeps its identity and site-packages), the
+        # resolved interpreter binary, and the venv pyvenv.cfg identity.
+        interp = _e0_python_launcher_identity(cfg, lab)
+        _e0_bind_reference_identity(interp, args)
+        python = Path(interp["cantera_python"])
+        python_sha = interp["cantera_python_sha256"]
+        deadline = _e0_deadline(cfg)
+        run_root = _e0_path(cfg, "run_root", lab)
+        output_root = run_root / "output"
+        scratch = run_root / "scratch"
+        if output_root.exists() and any(output_root.iterdir()):
+            raise RuntimeError(f"output root already exists and is nonempty: {output_root}")
+        if scratch.exists():
+            raise RuntimeError(f"scratch already exists: {scratch}")
+        staged = _e0_stage_task_setup(cfg, auth, lab, scratch)
+        config_snapshot = _e0_validation_config_snapshot(harness_path, auth, scratch)
+        cmd = [
+            str(python), str(harness_path),
+            "--nrg", str(scratch),
+            "--nrg-binary", str(exe_path),
+            "--config", str(config_snapshot),
+            "--output", str(output_root),
+            "--workdir", str(scratch / "package_interface"),
+            "--build-manifest", str(_e0_path(cfg, "build_root", lab) / "build_manifest.json"),
+            "--only", selector,
+            "--mode", "full",
+        ]
+        _run_bounded(cmd, "equilibrium validation harness", _e0_remaining(deadline), output_root / "harness_run.log")
+        parsed = _e0_parse_results(output_root, selector)
+        rec = parsed["result"]
+        if rec.get("status") != "PASS":
+            raise RuntimeError(f"harness status {rec.get('status')} != PASS: {rec.get('reason')}")
+        acceptance = auth["acceptance"]
+        issues = _e0_independent_checks(rec, acceptance, parsed["case_dir"])
+        if issues:
+            raise RuntimeError("independent acceptance checks failed: " + "; ".join(issues))
+        return emit({
+            "scientific_pass": True,
+            "verification_mode": "full",
+            "reference_engine": "cantera",
+            "reference_required": True,
+            "mechanism": selector,
+            "harness_status": rec.get("status"),
+            "independent_checks": "passed",
+            "acceptance_thresholds": acceptance,
+            "validation_config_sha256": auth["validation_config_sha256"],
+            "cantera_python": str(python),
+            "cantera_python_resolved": interp["cantera_python_resolved"],
+            "cantera_python_sha256": python_sha,
+            "cantera_is_venv": interp["cantera_is_venv"],
+            "cantera_venv_root": interp["cantera_venv_root"],
+            "cantera_pyvenv_cfg_sha256": interp["cantera_pyvenv_cfg_sha256"],
+            "equilibrium": rec.get("comparisons", {}).get("equilibrium", {}),
+            "staged_files": len(staged.get("staged_files", {})),
+            "staged_input_manifest_sha256": staged["staged_input_manifest_sha256"],
+            "staged_input_manifest": staged["staged_input_manifest"],
+            "staged_commit": staged["approved_commit"],
+            "output_root": str(output_root),
+        })
+    except _E0ReferenceNotConfigured as exc:
+        return emit({
+            "scientific_pass": False,
+            "optional_reference": True,
+            "reference_engine": "cantera",
+            "reference_status": _E0_REFERENCE_NOT_CONFIGURED,
+            "error": f"{_E0_REFERENCE_NOT_CONFIGURED}: {type(exc).__name__}: {exc}",
+        }, 3)
+    except Exception as exc:
+        return emit({"error": f"{type(exc).__name__}: {exc}", "scientific_pass": False}, 2)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--laboratory", default=None)
@@ -3209,13 +4820,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--expected-staged-path", action="append", default=[])
     s.add_argument("--expected-unexpected-change", action="append", default=[])
 
+    s = sub.add_parser("e0-build-plan")
+
+    s = sub.add_parser("e0-build-execute")
+    s.add_argument("--expected-source-sha256", default=None)
+    s.add_argument("--expected-commit", default=None)
+
+    s = sub.add_parser("e0-validate-plan")
+    # Opt-in availability probe only: importing Cantera requires explicit
+    # operator authorization, so planning never imports it by default.
+    s.add_argument("--probe-cantera-reference", action="store_true")
+
+    s = sub.add_parser("e0-validate-execute")
+    s.add_argument("--expected-cantera-python-launcher", default=None)
+    s.add_argument("--expected-cantera-pyvenv-sha256", default=None)
+    s.add_argument("--expected-executable-sha256", default=None)
+    s.add_argument("--expected-harness-sha256", default=None)
+    s.add_argument("--expected-validation-config-sha256", default=None)
+    s.add_argument("--expected-cantera-python-sha256", default=None)
+
     return p
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        lab = Laboratory.load(args.laboratory)
+        lab = Laboratory.load(args.laboratory, require_runtime=False)
         commands = {
             "lab-info": cmd_lab_info,
             "campaign-list": cmd_campaign_list,
@@ -3276,6 +4906,10 @@ def main() -> int:
             "dev-commit-execute": cmd_dev_commit_execute,
             "dev-discard-plan": cmd_dev_discard_plan,
             "dev-discard-execute": cmd_dev_discard_execute,
+            "e0-build-plan": cmd_e0_build_plan,
+            "e0-build-execute": cmd_e0_build_execute,
+            "e0-validate-plan": cmd_e0_validate_plan,
+            "e0-validate-execute": cmd_e0_validate_execute,
         }
         return commands[args.command](args, lab)
     except Exception as exc:

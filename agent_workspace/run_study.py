@@ -74,19 +74,116 @@ def changed_raw_files(
     return changed
 
 
-def _runtime_provenance(lab: Laboratory) -> dict[str, Any]:
-    runtime: dict[str, Any] = {
-        "computing_module": {
-            "path": str(lab.computing_module),
-            "sha256": sha256_file(lab.computing_module),
-        },
-        "package_interfaces": {},
+def _component_provenance(path: Path) -> dict[str, Any]:
+    """Provenance for one runtime component without fabricating a hash.
+
+    Hashability is tracked separately from executable readiness: a readable but
+    non-executable file keeps its real digest while remaining unready.  Only a
+    missing or unreadable component gets ``sha256 = None`` plus a ``read_error``.
+    """
+
+    exists = path.is_file()
+    executable = bool(exists and (os.name == "nt" or os.access(path, os.X_OK)))
+    digest: str | None = None
+    read_error: str | None = None
+    if exists:
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            read_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "path": str(path),
+        "exists": bool(exists),
+        "executable": executable,
+        "readable": digest is not None,
+        "sha256": digest,
+        "read_error": read_error,
     }
-    for name, path in lab.package_interfaces.items():
-        runtime["package_interfaces"][name] = {
-            "path": str(path),
-            "sha256": sha256_file(path),
-        }
+
+
+def _component_ready(component: dict[str, Any]) -> bool:
+    """Ready means present, executable, and hashable (P1A bridge semantics)."""
+
+    return bool(component["executable"] and component["readable"])
+
+
+def _runtime_provenance(lab: Laboratory) -> dict[str, Any]:
+    """Analysis-time runtime provenance using the established P1A semantics.
+
+    ``runtime_available`` means at least one usable runtime capability exists
+    (execution or preparation); it is not a statement that CFD can run.  Use
+    ``execution_ready`` for that.  Preparation also requires a task-setup
+    directory that exists and is named ``task_setup``.
+
+    This is the runtime present at analysis time; it need not be the runtime
+    that produced archived case results.
+    """
+
+    computing_module = _component_provenance(lab.computing_module)
+    task_setup = {
+        "path": str(lab.task_setup_template),
+        "exists": lab.task_setup_template.is_dir(),
+        "named_task_setup": lab.task_setup_template.name == "task_setup",
+    }
+    task_setup_ready = bool(task_setup["exists"] and task_setup["named_task_setup"])
+    package_interfaces = {
+        name: _component_provenance(path)
+        for name, path in sorted(lab.package_interfaces.items())
+    }
+    computing_ready = _component_ready(computing_module)
+    preparation_ready = {
+        name: bool(task_setup_ready and _component_ready(component))
+        for name, component in package_interfaces.items()
+    }
+    preparation_ready.setdefault("0d", False)
+    preparation_ready.setdefault("1d", False)
+
+    unavailable: list[str] = []
+    unreadable: list[str] = []
+    if not computing_ready:
+        unavailable.append("computing_module")
+    if (
+        computing_module["exists"]
+        and computing_module["executable"]
+        and not computing_module["readable"]
+    ):
+        unreadable.append("computing_module")
+    if not task_setup["exists"]:
+        unavailable.append("task_setup")
+    elif not task_setup["named_task_setup"]:
+        unavailable.append("task_setup_name")
+    for name, component in package_interfaces.items():
+        if not _component_ready(component):
+            unavailable.append(f"package_interface_{name}")
+        if (
+            component["exists"]
+            and component["executable"]
+            and not component["readable"]
+        ):
+            unreadable.append(f"package_interface_{name}")
+
+    runtime: dict[str, Any] = {
+        # Legacy per-component keys are preserved: path and sha256 stay present,
+        # with sha256=None only when the file is absent or cannot be read.
+        "computing_module": computing_module,
+        "task_setup": task_setup,
+        "package_interfaces": package_interfaces,
+        "execution_ready": computing_ready,
+        "preparation_ready": preparation_ready,
+        "preparation_ready_0d": preparation_ready["0d"],
+        "preparation_ready_1d": preparation_ready["1d"],
+        # At least one usable capability, not "CFD execution is possible".
+        "runtime_available": bool(computing_ready or any(preparation_ready.values())),
+        "unavailable": unavailable,
+        "unreadable": unreadable,
+        "provenance_note": (
+            "Runtime present at analysis time; it need not be the runtime that "
+            "produced archived case results. Readiness is execution_ready / "
+            "preparation_ready, not hash presence: a readable non-executable "
+            "component keeps its digest yet is not ready, and an unready component "
+            "does not necessarily have a null sha256."
+        ),
+    }
     if lab.runtime_manifest.is_file():
         runtime["runtime_manifest"] = {
             "path": str(lab.runtime_manifest),
@@ -288,7 +385,9 @@ def main() -> int:
 
     manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
     lab_path = args.laboratory or manifest.get("laboratory_config")
-    lab = Laboratory.load(lab_path)
+    # Offline/synthetic analysis reads existing data and must not require the
+    # external NRG executables.  Runtime readiness is recorded as provenance.
+    lab = Laboratory.load(lab_path, require_runtime=False)
 
     studies_root = lab.studies_root.resolve()
     try:

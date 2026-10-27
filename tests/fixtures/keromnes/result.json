@@ -1,0 +1,50 @@
+{
+  "mechanism": "hydrogen/KEROMNES.txt",
+  "validation_mode": "full",
+  "status": "PASS",
+  "reason": "All screening tolerances satisfied",
+  "species": 11,
+  "reactions": 24,
+  "parser_input": {
+    "species": 11,
+    "reactions": 24,
+    "falloff": 5,
+    "troe": 5,
+    "explicit_M": 4,
+    "irreversible": 0,
+    "energy_units": "cal.mol",
+    "quantity_units": "MOLES"
+  },
+  "comparisons": {
+    "equilibrium": {
+      "tp": {
+        "converged": true,
+        "max_absolute_mole_fraction_error": 4.142242104876459e-13,
+        "temperature_error_K": 0.0,
+        "nrg_diagnostics": {
+          "max_element_relative_residual": 1.313782416190179e-15,
+          "mass_relative_residual": 0.0,
+          "mole_fraction_sum_residual": 1.1102230246251565e-16,
+          "stationarity_residual": 0.0,
+          "enthalpy_relative_residual": 0.0
+        },
+        "cantera_temperature_K": 1500.0,
+        "nrg_temperature_K": 1500.0
+      },
+      "hp": {
+        "converged": true,
+        "max_absolute_mole_fraction_error": 3.764766276503906e-13,
+        "temperature_error_K": 4.262346919858828e-09,
+        "nrg_diagnostics": {
+          "max_element_relative_residual": 2.2521984277545927e-15,
+          "mass_relative_residual": 3.317904514061383e-16,
+          "mole_fraction_sum_residual": 2.220446049250313e-16,
+          "stationarity_residual": 3.552713678800501e-15,
+          "enthalpy_relative_residual": 9.644228646507566e-11
+        },
+        "cantera_temperature_K": 2387.624866677726,
+        "nrg_temperature_K": 2387.6248666734637
+      }
+    }
+  }
+}

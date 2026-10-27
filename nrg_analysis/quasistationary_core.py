@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 
 
 NUMBER_RE = re.compile(r"[-+]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[EeDd][-+]?\d+)?")
+_METADATA_RE = re.compile(r"^\s*(?:TITLE|VARIABLES)\s*=", re.IGNORECASE)
 TIME_FACTORS = {
     "seconds": 1.0,
     "milliseconds": 1.0e-3,
@@ -501,6 +502,32 @@ def _parse_number_line(line: str) -> list[float]:
     return [float(m.group(0).replace("D", "E").replace("d", "e")) for m in NUMBER_RE.finditer(line)]
 
 
+def _is_metadata_line(line: str) -> bool:
+    return bool(_METADATA_RE.match(line))
+
+
+def _parse_numeric_row(line: str, path: Path, line_number: int) -> list[float]:
+    """Parse one complete numeric record without accepting stray text."""
+    values: list[float] = []
+    cursor = 0
+    for match in NUMBER_RE.finditer(line):
+        gap = line[cursor : match.start()]
+        if gap.strip():
+            raise ValueError(f"{path}:{line_number}: malformed numeric row near {gap.strip()!r}")
+        token = match.group(0)
+        try:
+            values.append(float(token.replace("D", "E").replace("d", "e")))
+        except ValueError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid numeric token {token!r}") from exc
+        cursor = match.end()
+    tail = line[cursor:]
+    if tail.strip():
+        raise ValueError(f"{path}:{line_number}: malformed numeric row near {tail.strip()!r}")
+    if not values:
+        raise ValueError(f"{path}:{line_number}: no numeric values")
+    return values
+
+
 def _find_postprocessor_setup(case_path: Path, output_file: str) -> tuple[str, list[str]]:
     candidates = sorted((case_path / "task_setup").glob("post_processor*.inf"))
     for path in candidates:
@@ -529,26 +556,43 @@ def _read_numeric_rows_online(path: Path) -> list[list[float]]:
     if not path.is_file():
         raise FileNotFoundError(path)
     text = path.read_text(encoding="utf-8", errors="replace")
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
-        raise TransientHistoryError(f"history exists but contains no complete rows yet: {path}")
+    lines = text.splitlines()
+    parsed: list[list[float]] = []
+    data_started = False
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if _is_metadata_line(line):
+            if data_started:
+                raise ValueError(f"{path}:{index + 1}: metadata line after numerical data")
+            continue
+        is_last = not any(candidate.strip() for candidate in lines[index + 1 :])
+        try:
+            row = _parse_numeric_row(line, path, index + 1)
+        except ValueError:
+            if not is_last:
+                raise
+            # Only a final record without a newline is assumed to be mid-write.
+            # A newline-terminated malformed record is a schema/data error.
+            if not text.endswith(("\n", "\r")) and _parse_number_line(line):
+                break
+            raise
+        parsed.append(row)
+        data_started = True
 
-    parsed = [_parse_number_line(line) for line in lines]
-    parsed = [row for row in parsed if row]
     if not parsed:
         raise TransientHistoryError(f"history contains no complete numerical rows yet: {path}")
     width = len(parsed[0])
     bad = [i for i, row in enumerate(parsed) if len(row) != width]
     if bad:
         # Concurrent append is allowed to leave only the final row incomplete.
-        if bad == [len(parsed) - 1]:
+        last = len(parsed) - 1
+        if bad == [last] and len(parsed[last]) < width:
             parsed = parsed[:-1]
         else:
             raise ValueError(f"inconsistent numerical row widths in {path}; bad rows={bad[:8]}")
     if not parsed:
         raise TransientHistoryError(f"history has only an incomplete trailing record: {path}")
-    if any(len(row) != width for row in parsed):
-        raise ValueError(f"inconsistent numerical row widths in {path}")
     return parsed
 
 

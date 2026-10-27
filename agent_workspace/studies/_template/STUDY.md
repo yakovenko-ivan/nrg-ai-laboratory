@@ -8,10 +8,17 @@
 
 - Laboratory configuration: `{{LABORATORY_CONFIG}}`
 - Campaign manifest: `{{CASES_CSV}}`
-- Case-root fallback for legacy relative `case_path` values: `{{CASE_ROOT}}`
+- Case root used to resolve relative `case_path` values: `{{CASE_ROOT}}`
 
-New campaign manifests should normally contain absolute `case_path` values, so
-`case_root` is only a compatibility fallback.
+### Portable case locators
+
+Prefer relative `case_path` values resolved beneath `case_root`: they survive
+moving a campaign between workstations or execution hosts. Absolute paths may be
+recorded in `study_manifest.json` and `provenance.json` as audit provenance, but
+they are **not** reusable dependencies: do not require a specific machine path, a
+historical campaign directory, or a particular production case ID. Analysis must
+run from the case data described by the manifest it is given, including synthetic
+or reduced datasets.
 
 ## Analysis development plan
 
