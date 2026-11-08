@@ -86,7 +86,7 @@ def species_growth(
         if molar_masses is None:
             raise ValueError("molar masses required for concentration-based species-growth metric")
         signal = molar_concentration(history.density_kg_m3, y, species, molar_masses)
-        units = "kmol/m3/s"
+        units = "mol/m3/s"
         signal_name = f"[{species}]"
     else:
         signal = list(y)
@@ -119,7 +119,7 @@ def species_peak(
         if molar_masses is None:
             raise ValueError("molar masses required for concentration-based species-peak metric")
         signal = molar_concentration(history.density_kg_m3, y, species, molar_masses)
-        units = "kmol/m3"
+        units = "mol/m3"
         signal_name = f"[{species}]"
     else:
         signal = list(y)

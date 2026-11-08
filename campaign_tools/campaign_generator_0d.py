@@ -258,7 +258,11 @@ def task_setup_resource_provenance(cases: list[dict[str, Any]], laboratory: Labo
             "size": path.stat().st_size,
         }
 
-    thermo_names: set[str] = {"molar_masses.dat"}
+    # Molar masses are derived by the NRG thermophysical class from the same
+    # NASA/CHEMKIN elemental composition used for thermo_data_file.  The
+    # obsolete molar_masses.dat is therefore not a generation-time resource and
+    # is not hashed here; historical case directories may still contain it.
+    thermo_names: set[str] = set()
     effective_cases: dict[str, Any] = {}
     for item in cases:
         phy = item["groups"]["physics_config"]

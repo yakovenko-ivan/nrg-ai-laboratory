@@ -11,13 +11,23 @@ from typing import Mapping, Sequence
 class MolarMassDatabase:
     """Molar masses indexed case-insensitively.
 
-    NRG's ``molar_masses.dat`` values are in kg/kmol numerically equivalent to
-    g/mol.  For concentration ``rho*Y/M`` with rho in kg/m3, the result is
-    kmol/m3 when M is in kg/kmol.
+    Legacy NRG ``molar_masses.dat`` files store molar masses in kg/mol, the
+    same unit used by NRG's thermophysical class (for example H2 is
+    2.016e-3 kg/mol).  For concentration ``rho*Y/M`` with rho in kg/m3 and M in
+    kg/mol, the result is mol/m3.
+
+    ``values_kg_per_kmol`` is the historical field name and is retained for
+    backward compatibility with existing study code; its contents are kg/mol
+    values parsed from the legacy file.
     """
 
     values_kg_per_kmol: Mapping[str, float]
     source: Path | None = None
+
+    @property
+    def values_kg_per_mol(self) -> Mapping[str, float]:
+        """Molar masses in kg/mol (preferred name for the legacy field)."""
+        return self.values_kg_per_kmol
 
     @classmethod
     def from_file(cls, path: str | Path) -> "MolarMassDatabase":
@@ -54,12 +64,12 @@ class MolarMassDatabase:
 
     def get(self, species: str) -> float:
         try:
-            return self.values_kg_per_kmol[species.upper()]
+            return self.values_kg_per_mol[species.upper()]
         except KeyError as exc:
             raise KeyError(f"molar mass unavailable for species {species!r}") from exc
 
     def has(self, species: str) -> bool:
-        return species.upper() in self.values_kg_per_kmol
+        return species.upper() in self.values_kg_per_mol
 
 
 def mass_to_mole_fractions(
@@ -82,6 +92,7 @@ def molar_concentration(
     species: str,
     molar_masses: MolarMassDatabase,
 ) -> list[float]:
+    """Return species molar concentration in mol/m3."""
     if len(density_kg_m3) != len(mass_fraction):
         raise ValueError("density and mass-fraction arrays have different lengths")
     mass = molar_masses.get(species)

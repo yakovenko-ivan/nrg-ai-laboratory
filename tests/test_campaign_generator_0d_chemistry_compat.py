@@ -79,7 +79,6 @@ def make_lab(root: Path) -> Laboratory:
         (thermo / f"{mechanism}_TRANSDATA.txt").write_text(
             f"synthetic {mechanism} transport\n", encoding="utf-8"
         )
-    (thermo / "molar_masses.dat").write_text("synthetic molar masses\n", encoding="utf-8")
 
     computing = root / "bin" / "computing_module"
     computing.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -568,6 +567,7 @@ class ChemistryBackendCompatibilityTests(unittest.TestCase):
                 ("KEROMNES_THERMO.txt", "KEROMNES_TRANSDATA.txt", True),
             )
             resources = task_setup_resource_provenance(cases, lab)
+            self.assertNotIn("molar_masses.dat", resources["thermophysical_data"])
             self.assertIn("KEROMNES_THERMO.txt", resources["thermophysical_data"])
             self.assertIn("KEROMNES_TRANSDATA.txt", resources["thermophysical_data"])
             self.assertNotIn("COMMON_THERMO.txt", resources["thermophysical_data"])
@@ -580,6 +580,30 @@ class ChemistryBackendCompatibilityTests(unittest.TestCase):
                 entry["sha256"],
                 sha256_file(lab.task_setup_template / entry["relative_path"]),
             )
+
+    def test_generation_provenance_does_not_require_legacy_molar_masses(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lab = make_lab(root)
+            legacy = (
+                lab.task_setup_template
+                / "thermophysical_data"
+                / "molar_masses.dat"
+            )
+            self.assertFalse(legacy.exists())
+
+            definition = root / "no_legacy_molar_masses.toml"
+            write_campaign(definition, "no_legacy_molar_masses", temps=[1000.0])
+            cases = expand(definition, lab)
+            resources = task_setup_resource_provenance(cases, lab)
+            self.assertNotIn("molar_masses.dat", resources["thermophysical_data"])
+            self.assertEqual(
+                set(resources["thermophysical_data"]),
+                {"KEROMNES_THERMO.txt", "KEROMNES_TRANSDATA.txt"},
+            )
+            for entry in resources["thermophysical_data"].values():
+                actual = lab.task_setup_template / entry["relative_path"]
+                self.assertEqual(entry["sha256"], sha256_file(actual))
 
     def test_real_keromnes_resources_resolve_from_configured_laboratory(self):
         here = Path(__file__).resolve()
@@ -612,6 +636,7 @@ class ChemistryBackendCompatibilityTests(unittest.TestCase):
             write_campaign(definition, "real_keromnes", temps=[1000.0], mechanism="keromnes")
             cases = expand(definition, lab)
             resources = task_setup_resource_provenance(cases, lab)
+            self.assertNotIn("molar_masses.dat", resources["thermophysical_data"])
             kinetic = resources["kinetic_mechanisms"]["keromnes"]
             self.assertTrue(kinetic["relative_path"].endswith("hydrogen/KEROMNES.txt"))
             per_case = resources["effective_case_resources"][cases[0]["case_id"]]

@@ -44,10 +44,11 @@ def make_lab(root: Path) -> Laboratory:
     ):
         p.mkdir(parents=True, exist_ok=True)
 
-    # Generation-time scientific provenance now hashes the actual
-    # task_setup resources used by each generated campaign.  This synthetic
-    # Laboratory therefore needs minimal stand-ins for the mechanisms exercised
-    # by this test module and for the always-recorded molar-mass database.
+    # Generation-time scientific provenance hashes the actual task_setup
+    # resources used by each generated campaign.  This synthetic Laboratory
+    # therefore needs minimal stand-ins for the mechanisms exercised by this
+    # test module.  The obsolete molar_masses.dat is intentionally absent:
+    # molar masses now come from the NASA/CHEMKIN thermo records.
     chemistry = root / "resources" / "task_setup" / "chemical_mechanisms"
     thermo = root / "resources" / "task_setup" / "thermophysical_data"
     chemistry.mkdir(parents=True, exist_ok=True)
@@ -55,7 +56,6 @@ def make_lab(root: Path) -> Laboratory:
     (chemistry / "KONNOV.txt").write_text("synthetic KONNOV mechanism\n", encoding="utf-8")
     (chemistry / "KEROMNES.txt").write_text("synthetic KEROMNES mechanism\n", encoding="utf-8")
     (chemistry / "ZHANG.txt").write_text("synthetic ZHANG mechanism\n", encoding="utf-8")
-    (thermo / "molar_masses.dat").write_text("synthetic molar masses\n", encoding="utf-8")
     for mechanism in ("KEROMNES", "KONNOV", "ZHANG"):
         (thermo / f"{mechanism}_THERMO.txt").write_text(
             f"synthetic {mechanism} thermo\n", encoding="utf-8"
@@ -301,12 +301,22 @@ class CampaignIdentityAttemptTests(unittest.TestCase):
                 self.assertEqual(entry["size"], resource.stat().st_size)
 
             thermo = resources["thermophysical_data"]
-            self.assertIn("molar_masses.dat", thermo)
-            molar = lab.task_setup_template / thermo["molar_masses.dat"]["relative_path"]
+            self.assertNotIn("molar_masses.dat", thermo)
             self.assertEqual(
-                thermo["molar_masses.dat"]["sha256"],
-                sha256_file(molar),
+                set(thermo),
+                {
+                    "KEROMNES_THERMO.txt",
+                    "KEROMNES_TRANSDATA.txt",
+                    "KONNOV_THERMO.txt",
+                    "KONNOV_TRANSDATA.txt",
+                },
             )
+            for filename, entry in thermo.items():
+                resource = lab.task_setup_template / entry["relative_path"]
+                self.assertTrue(resource.is_file())
+                self.assertEqual(resource.name, filename)
+                self.assertEqual(entry["sha256"], sha256_file(resource))
+                self.assertEqual(entry["size"], resource.stat().st_size)
 
     def test_duplicate_logical_identity_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
