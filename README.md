@@ -72,6 +72,11 @@ config/laboratory.local.toml
 
 See `docs/nrg-integration.md` and `docs/configuration.md`.
 
+For a reproducible Windows 11 / WSL2 installation and validation procedure —
+Intel oneAPI runtime handling, separate NRG computing-module/0D/1D builds,
+machine-local configuration and acceptance checks — see
+[`docs/wsl2-deployment.md`](docs/wsl2-deployment.md).
+
 ## Bootstrap
 
 From a fresh clone:

@@ -117,6 +117,13 @@ nrg-lab lab-info
 `nrg-lab` operations that depend on trusted NRG execution require the external
 NRG paths to validate successfully.
 
+## Windows 11 / WSL2
+
+A reproducible WSL2 Ubuntu deployment procedure — oneAPI runtime initialization,
+separate NRG computing-module/0D/1D builds, machine-local overlay, optional
+Cantera 3.2.0 reference environment and machine-level acceptance checks — is
+documented in [`wsl2-deployment.md`](wsl2-deployment.md).
+
 ## Pi
 
 Start Pi using this cloned repository as the project root.  The repository
