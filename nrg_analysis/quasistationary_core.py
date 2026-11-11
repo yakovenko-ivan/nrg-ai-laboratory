@@ -374,9 +374,12 @@ def evaluate(
     activation_terms = [activation_temperature]
     if activation_fuel is not None:
         activation_terms.append(activation_fuel)
-    activation_satisfied = (
-        any(activation_terms) if profile.activation_mode == "any" else all(activation_terms)
-    )
+    if profile.activation_mode == "any":
+        activation_satisfied = any(activation_terms)
+    else:
+        # Fail closed when the declared fuel species is absent: a missing fuel
+        # gate must never degrade into the temperature gate.
+        activation_satisfied = activation_fuel is not None and all(activation_terms)
 
     rel_T = _relative_span(t_values, 1.0)
     rel_p = _relative_span(p_values, 1.0)
