@@ -18,7 +18,29 @@ from statistics import fmean
 from typing import Any, Mapping, Sequence
 
 
-NUMBER_RE = re.compile(r"[-+]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[EeDd][-+]?\d+)?")
+# NRG post-processor output is Fortran-formatted.  Besides the usual explicit
+# ``E``/``D`` exponent notation, a Fortran ``Ew.dEe`` edit descriptor omits the
+# ``E`` marker when the exponent does not fit its declared two-digit ``Ee``
+# field and writes it with extra digits, producing tokens such as
+# ``0.566278959029-300``.  That overflow form always carries exactly three
+# exponent digits, so an implicit exponent is recognised only on a decimal
+# mantissa followed by a sign and exactly three digits.  Shorter bare suffixes
+# (``1.2-3``, ``1.2-30``) are deliberately *not* guessed: they cannot be
+# distinguished from two adjacent numeric fields and must keep their
+# field-separated meaning.  A negative lookahead additionally rejects a
+# following digit or decimal point, so an adjacent negative value such as
+# ``0.5-0.3`` is still read as two fields rather than one exponent.
+_MANTISSA_PATTERN = r"[-+]?(?:(?:\d+\.\d*)|(?:\.\d+))"
+_INTEGER_PATTERN = r"[-+]?\d+"
+_EXPLICIT_EXPONENT_PATTERN = r"[EeDd][-+]?\d+"
+_IMPLICIT_EXPONENT_PATTERN = r"[-+]\d{3}"
+NUMBER_RE = re.compile(
+    rf"{_MANTISSA_PATTERN}(?:{_EXPLICIT_EXPONENT_PATTERN}|{_IMPLICIT_EXPONENT_PATTERN}(?![.\d]))?"
+    rf"|{_INTEGER_PATTERN}(?:{_EXPLICIT_EXPONENT_PATTERN})?"
+)
+_IMPLICIT_TOKEN_RE = re.compile(
+    rf"^(?P<mantissa>{_MANTISSA_PATTERN})(?P<exponent>{_IMPLICIT_EXPONENT_PATTERN})$"
+)
 _METADATA_RE = re.compile(r"^\s*(?:TITLE|VARIABLES)\s*=", re.IGNORECASE)
 TIME_FACTORS = {
     "seconds": 1.0,
@@ -501,8 +523,25 @@ def _species_from_field(field_name: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _normalize_float_token(token: str) -> str:
+    """Convert one matched NRG numeric token into valid Python float syntax.
+
+    Explicit Fortran ``D``/``d`` exponents are mapped to ``E``/``e``.  A token
+    with an implicit exponent (``0.566278959029-300``) is rewritten as
+    ``0.566278959029e-300`` before conversion.  Any other token is returned
+    unchanged so that malformed input still fails loudly in ``float``.
+    """
+    text = token.strip()
+    if any(marker in text for marker in "EeDd"):
+        return text.replace("D", "E").replace("d", "e")
+    match = _IMPLICIT_TOKEN_RE.match(text)
+    if match is not None:
+        return f"{match.group('mantissa')}e{match.group('exponent')}"
+    return text
+
+
 def _parse_number_line(line: str) -> list[float]:
-    return [float(m.group(0).replace("D", "E").replace("d", "e")) for m in NUMBER_RE.finditer(line)]
+    return [float(_normalize_float_token(m.group(0))) for m in NUMBER_RE.finditer(line)]
 
 
 def _is_metadata_line(line: str) -> bool:
@@ -519,7 +558,7 @@ def _parse_numeric_row(line: str, path: Path, line_number: int) -> list[float]:
             raise ValueError(f"{path}:{line_number}: malformed numeric row near {gap.strip()!r}")
         token = match.group(0)
         try:
-            values.append(float(token.replace("D", "E").replace("d", "e")))
+            values.append(float(_normalize_float_token(token)))
         except ValueError as exc:
             raise ValueError(f"{path}:{line_number}: invalid numeric token {token!r}") from exc
         cursor = match.end()
