@@ -20,6 +20,7 @@
     "config/dev_transaction_policy.json",
     "agent_workspace/workspace_policy.json",
     "agent_workspace/lab_bridge.py",
+    "agent_workspace/l0_audit.py",
     ".pi/extensions/nrg-laboratory/index.ts",
     ".pi/extensions/nrg-laboratory/read_only_shell.ts",
     "config/read_only_shell_policy.json",

@@ -1497,6 +1497,60 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "nrg_l0_audit_plan",
+    label: "NRG L0 Audit Plan",
+    description: "Read-only readiness plan for the mechanism-independent L0 audit of the mesh-free NRG thermochemistry/kinetics interface. Verifies the authorized commit, audit source hash, built executable hash, build manifest identity, per-case approved-commit input hashes and a fresh audit run root. Writes nothing, builds nothing and runs nothing.",
+    promptSnippet: "Plan the trusted L0 direct audit (read-only)",
+    promptGuidelines: [
+      "Use only after the operator installed the scoped audit authorization record and a hash-pinned executable built from the approved commit.",
+      "This command is read-only: it never builds, never executes the audit binary and never writes to the run root.",
+      "can_run=false is a readiness result, not a scientific verdict; report the exact error.",
+      "Mechanism set, modes and compositions come only from the authorization record; no argument can broaden them.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["l0-audit-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_l0_audit_execute",
+    label: "NRG L0 Audit Execute",
+    description: "Execute the authorized, mechanism-independent L0 audit of the existing mesh-free NRG thermochemistry/kinetics interface in isolated per-case directories, with plan-to-execute hash binding, a per-case wall cap bounded by the remaining total budget, a strict unexpected-output policy and complete output/log/artifact hashing. Never runs computing_module and never writes to canonical task_setup, runs/ or campaigns/.",
+    promptSnippet: "Execute the trusted L0 direct audit",
+    promptGuidelines: [
+      "Use only after nrg_l0_audit_plan returned can_run=true and the operator authorized execution for this exact plan.",
+      "A zero exit code is not a scientific PASS; the recorded per-case status, log hash and artifact hashes are authoritative.",
+      "Fixtures are grammar checks only: a refusal is a PASS only with a genuine nonzero parser exit and the frozen diagnostic.",
+      "Do not retry a failed case; report its classification and stop.",
+      "This never builds NRG, never runs computing_module and never executes Cantera.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["l0-audit-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "l0 audit execute requires interactive confirmation", plan });
+      if (!plan.executable_sha256 || !plan.commit || !plan.source_sha256 || !plan.cases_sha256)
+        return toolResult({ error: "l0 audit plan missing executable/commit/source/cases identity; refusing to execute", plan });
+      const ok = await ctx.ui.confirm(
+        "Execute the authorized L0 audit?",
+        `Commit ${String(plan.commit).slice(0, 12)}, executable ${String(plan.executable_sha256).slice(0, 12)}, ` +
+        `${Array.isArray(plan.cases) ? plan.cases.length : "?"} case(s), fixtures ${plan.fixtures_enabled ? "on" : "off"}, ` +
+        `run root ${plan.audit_run_root}. Isolated; no CFD, no Cantera, no build.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = [
+        "l0-audit-execute",
+        "--expected-executable-sha256", plan.executable_sha256,
+        "--expected-commit", plan.commit,
+        "--expected-source-sha256", plan.source_sha256,
+        "--expected-cases-sha256", plan.cases_sha256,
+      ];
+      return toolResult(await bridge(execArgs, signal, E0_TIMEOUT_MS));
+    },
+  });
+
   pi.registerCommand("nrg-tools", {
     description: "Show registered and active NRG laboratory tools",
     handler: async (_args, ctx) => {
