@@ -1551,6 +1551,49 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "nrg_g2_l1_plan",
+    label: "NRG G2-L1 Convergence Plan",
+    description: "Read-only plan for a fixed 6-case, hash-pinned, single-cell SLATEC tolerance/time-step pilot. Does not build NRG, execute binaries, run Cantera, or write files.",
+    promptGuidelines: [
+      "Run this before nrg_g2_l1_execute; inspect can_run and plan_sha256.",
+      "Only the operator-installed authorization and immutable source hashes select the binary and scientific cases.",
+      "Do not equate a completed six-case pilot with Cantera accuracy validation.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["g2-l1-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_execute",
+    label: "NRG G2-L1 Convergence Execute",
+    description: "After explicit interactive approval, run the fixed 6-case G2-L1 pilot in the trusted .local run root and export hash-verified evidence into the agent-readable study path. No arbitrary binary, chemistry or path arguments.",
+    promptGuidelines: [
+      "Never start without a successful read-only plan and interactive researcher confirmation.",
+      "STOP on first unexpected result; preserve evidence; never silently retry.",
+      "Report the convergence comparisons as provisional: no new Cantera reference is run here.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["g2-l1-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "G2-L1 execute requires interactive confirmation", plan });
+      if (!plan.plan_sha256 || !Array.isArray(plan.cases) || plan.cases.length !== 6)
+        return toolResult({ error: "G2-L1 plan missing expected six-case identity; refusing", plan });
+      const ok = await ctx.ui.confirm(
+        "Execute six G2-L1 chemistry cases?",
+        `B2 ${String(plan.binary_sha256).slice(0, 12)}, 3 eps × 2 dt, ≤${plan.case_timeout_s}s/case, ` +
+        `trusted run root ${plan.run_root}. No builds, no CFD, no Cantera.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge(
+        ["g2-l1-execute", "--expected-plan-sha256", plan.plan_sha256], signal, E0_TIMEOUT_MS,
+      ));
+    },
+  });
+
   pi.registerCommand("nrg-tools", {
     description: "Show registered and active NRG laboratory tools",
     handler: async (_args, ctx) => {
