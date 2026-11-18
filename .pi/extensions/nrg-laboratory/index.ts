@@ -1594,6 +1594,50 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "nrg_g2_l1_stage2_plan",
+    label: "NRG G2-L1 Reactive Chemistry Plan",
+    description: "Read-only bounded 5/20 us isothermal H2-air Cantera screening and SLATEC convergence plan. Verifies the same pinned B2 binary and KEROMNES; no execution.",
+    promptGuidelines: [
+      "The reference first screens oxygen consumption; if below 1% at 20 us, no NRG cases launch.",
+      "Review can_run, plan_sha256, maximum of six cases, timeouts and evidence destinations.",
+      "Do not claim ignition-delay validation: temperature is held constant.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["g2-l1-stage2-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_stage2_execute",
+    label: "NRG G2-L1 Reactive Chemistry Execute",
+    description: "Interactive researcher-confirmed Cantera oxygen-consumption screen, then at most six bounded single-cell NRG cases. Preserves evidence; stops for weak signal, failure or unexpected outputs.",
+    promptGuidelines: [
+      "Invoke only following a matching read-only Stage-2 plan and interactive approval.",
+      "Reference isothermal CV chemistry, not adiabatic ignition; do not silently extend the horizon.",
+      "Inspect and report the exported comparison and archive checksum; no automatic retries.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["g2-l1-stage2-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "G2 Stage-2 execution requires interactive operator confirmation", plan });
+      if (!plan.plan_sha256 || plan.maximum_cases !== 6 || plan.maximum_steps_per_case !== 4000)
+        return toolResult({ error: "G2 Stage-2 plan envelope invalid; refusing", plan });
+      const approved = await ctx.ui.confirm(
+        "Execute the G2-L1 reactive-chemistry pilot?",
+        `Cantera 5/20 us reference O2 screen (>=1% required), then at most 6 NRG cases; ` +
+        `<=${plan.reference_timeout_s}s reference and <=${plan.case_timeout_s}s per NRG case. ` +
+        `B2 ${String(plan.binary_sha256).slice(0,12)}, run root ${plan.run_root}. No rebuild or Cantera ignition claim.`,
+      );
+      if (!approved) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge(
+        ["g2-l1-stage2-execute", "--expected-plan-sha256", plan.plan_sha256], signal, E0_TIMEOUT_MS,
+      ));
+    },
+  });
+
   pi.registerCommand("nrg-tools", {
     description: "Show registered and active NRG laboratory tools",
     handler: async (_args, ctx) => {

@@ -22,6 +22,7 @@
     "agent_workspace/lab_bridge.py",
     "agent_workspace/l0_audit.py",
     "agent_workspace/g2_l1_convergence.py",
+    "agent_workspace/g2_l1_reactivity.py",
     ".pi/extensions/nrg-laboratory/index.ts",
     ".pi/extensions/nrg-laboratory/read_only_shell.ts",
     "config/read_only_shell_policy.json",
