@@ -4791,6 +4791,37 @@ def cmd_l0_audit_execute(args: argparse.Namespace, lab: Laboratory) -> int:
         return emit({"executed": False, "error": f"{type(exc).__name__}: {exc}"}, 2)
 
 
+def cmd_g2_l1_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    """Read-only frozen G2 convergence experiment plan; no arbitrary args."""
+    from agent_workspace import g2_l1_convergence
+    result = g2_l1_convergence.plan(Path(lab.research_root))
+    return emit(result, 0 if result.get("can_run") else 2)
+
+
+def cmd_g2_l1_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    """Plan-hash-bound run through the existing trusted process-group runner."""
+    from agent_workspace import g2_l1_convergence
+    result = g2_l1_convergence.execute(
+        Path(lab.research_root), args.expected_plan_sha256, _run_bounded,
+    )
+    return emit(result, 0 if result.get("status") == "COMPLETED_REVIEW_REQUIRED" else 2)
+
+
+def cmd_g2_l1_stage2_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    """Read-only Cantera-screened chemistry convergence contract."""
+    from agent_workspace import g2_l1_reactivity
+    result = g2_l1_reactivity.plan(Path(lab.research_root))
+    return emit(result, 0 if result.get("can_run") else 2)
+
+
+def cmd_g2_l1_stage2_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    """Operator-confirmed, hash-bound Cantera + bounded NRG execution."""
+    from agent_workspace import g2_l1_reactivity
+    result = g2_l1_reactivity.execute(
+        Path(lab.research_root), args.expected_plan_sha256, _run_bounded)
+    return emit(result, 0 if result.get("status") in (
+        "COMPLETED_REVIEW_REQUIRED", "INSUFFICIENT_REFERENCE_REACTIVITY") else 2)
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--laboratory", default=None)
@@ -5106,6 +5137,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--expected-cases-sha256", default=None)
     s.add_argument("--continue-on-failure", action="store_true")
 
+    sub.add_parser("g2-l1-plan")
+    s = sub.add_parser("g2-l1-execute")
+    s.add_argument("--expected-plan-sha256", required=True)
+
+    sub.add_parser("g2-l1-stage2-plan")
+    s = sub.add_parser("g2-l1-stage2-execute")
+    s.add_argument("--expected-plan-sha256", required=True)
+
     return p
 
 
@@ -5179,6 +5218,10 @@ def main() -> int:
             "e0-validate-execute": cmd_e0_validate_execute,
             "l0-audit-plan": cmd_l0_audit_plan,
             "l0-audit-execute": cmd_l0_audit_execute,
+            "g2-l1-plan": cmd_g2_l1_plan,
+            "g2-l1-execute": cmd_g2_l1_execute,
+            "g2-l1-stage2-plan": cmd_g2_l1_stage2_plan,
+            "g2-l1-stage2-execute": cmd_g2_l1_stage2_execute,
         }
         return commands[args.command](args, lab)
     except Exception as exc:

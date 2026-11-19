@@ -73,3 +73,7 @@ Thumbs.db
 
 # Machine-local E0 authorization record
 /config/e0_authorization.toml
+# Operator-owned G2-L1 trusted execution authorization (never commit).
+# Operator-owned G2-L1 Stage-2 authorization (never commit).
+/config/g2_l1_reactivity_authorization.toml
+/config/g2_l1_authorization.toml
