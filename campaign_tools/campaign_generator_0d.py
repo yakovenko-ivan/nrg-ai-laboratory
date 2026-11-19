@@ -117,6 +117,9 @@ GROUP_KEYS: dict[str, set[str]] = {
     },
     "mixture_config": {
         "hydrogen_mole_percent",
+        "fuel_mole_percent",
+        "fuel_specie_name",
+        "stoich_o2",
         "n2_o2_molar_ratio",
         "initial_temperature",
         "initial_pressure",
@@ -167,6 +170,7 @@ ALLOWED_SOLVERS = {
 ALLOWED_MECHANISMS = {
     "keromnes", "konnov", "zhang", "gerasimov_shatalov2013", "popov2007",
     "maas_pope1992", "li2004", "williams2004", "gri_mech3", "tereza", "hong2010",
+    "okafor", "varatharajan", "tereza_acetylene",
 }
 
 MECHANISM_FILES: dict[str, str] = {
@@ -181,6 +185,9 @@ MECHANISM_FILES: dict[str, str] = {
     "gri_mech3": "GRI_MECH_3_H2_checked_original.txt",
     "tereza": "hydrogen/TEREZA.txt",
     "hong2010": "HONG_2010_TABLE7_checked.txt",
+    "okafor": "ammonia/OKAFOR.txt",
+    "varatharajan": "acetylene/VARATHARAJAN.txt",
+    "tereza_acetylene": "acetylene/TEREZA_acetylene.txt",
 }
 
 # Mirrors resolve_mechanism() in the current 0D interface.  These mechanisms
@@ -191,12 +198,43 @@ FORCED_THERMO_TRANSPORT: dict[str, tuple[str, str]] = {
     "konnov": ("KONNOV_THERMO.txt", "KONNOV_TRANSDATA.txt"),
     "zhang": ("ZHANG_THERMO.txt", "ZHANG_TRANSDATA.txt"),
     "tereza": ("TEREZA_THERMO.txt", "TEREZA_TRANSDATA.txt"),
+    "okafor": ("OKAFOR_THERMO.txt", "OKAFOR_TRANSDATA.txt"),
+    "varatharajan": ("VARATHARAJAN_THERMO.txt", "VARATHARAJAN_TRANSDATA.txt"),
+    "tereza_acetylene": ("TEREZA_THERMO.txt", "TEREZA_TRANSDATA.txt"),
 }
 
 # Compiled Fortran defaults for thermo_data_file / transport_data_file.  They
 # apply when a mechanism does not force the names and the campaign omits them.
 FORTRAN_DEFAULT_THERMO = "KEROMNES_THERMO.txt"
 FORTRAN_DEFAULT_TRANSPORT = "KEROMNES_TRANSDATA.txt"
+
+# Canonical mechanism -> (fuel species, stoichiometric O2 coefficient) map.
+# Mirrors resolve_mechanism() in the extended 0D interface; the mechanism ID
+# alone determines the fuel, so a supplied value may only confirm it.
+MECHANISM_FUEL: dict[str, tuple[str, float]] = {
+    "keromnes": ("H2", 0.5),
+    "konnov": ("H2", 0.5),
+    "zhang": ("H2", 0.5),
+    "gerasimov_shatalov2013": ("H2", 0.5),
+    "popov2007": ("H2", 0.5),
+    "maas_pope1992": ("H2", 0.5),
+    "li2004": ("H2", 0.5),
+    "williams2004": ("H2", 0.5),
+    "gri_mech3": ("H2", 0.5),
+    "tereza": ("H2", 0.5),
+    "hong2010": ("H2", 0.5),
+    "okafor": ("NH3", 0.75),
+    "varatharajan": ("C2H2", 2.5),
+    "tereza_acetylene": ("C2H2", 2.5),
+}
+
+# Mechanisms whose thermo/transport pairing must match exactly.  A mismatch is
+# an error, never a silent KEROMNES-thermo fallback.
+STRICT_THERMO_TRANSPORT_MECHANISMS = {
+    "okafor",
+    "varatharajan",
+    "tereza_acetylene",
+}
 
 
 def _resolve_task_setup_resource(task_setup: Path, preferred_subdir: str, filename: str) -> Path:
@@ -227,6 +265,14 @@ def effective_thermo_transport(
     supplied_transport = str(phy.get("transport_data_file", "")).strip()
     if forced is not None:
         thermo, transport = forced
+        if mechanism_id in STRICT_THERMO_TRANSPORT_MECHANISMS and (
+            (supplied_thermo and supplied_thermo != thermo)
+            or (supplied_transport and supplied_transport != transport)
+        ):
+            raise ValueError(
+                f"{mechanism_id}: supplied thermo/transport files are inconsistent "
+                f"with the mechanism mapping ({thermo}, {transport})"
+            )
         overridden = bool(
             (supplied_thermo and supplied_thermo != thermo)
             or (supplied_transport and supplied_transport != transport)
@@ -307,6 +353,7 @@ TOKEN_ORDER = [
     ("mixture_config", "initial_temperature"),
     ("mixture_config", "initial_pressure"),
     ("mixture_config", "hydrogen_mole_percent"),
+    ("mixture_config", "fuel_mole_percent"),
     ("physics_config", "mechanism_id"),
     ("physics_config", "solver_id"),
     (CHEMISTRY_GROUP, "chemistry_backend"),
@@ -436,6 +483,81 @@ def _normalize_chemistry_config(chemistry: dict[str, Any]) -> None:
         chemistry["chemistry_backend"] = backend.strip().lower()
 
 
+def _normalize_mixture_fuel(groups: dict[str, dict[str, Any]]) -> None:
+    """Resolve and validate the fuel-aware mixture contract before fingerprinting.
+
+    Legacy H2 definitions (hydrogen_mole_percent only) are left byte-identical.
+    New definitions must use fuel_mole_percent; the mechanism mapping fills in
+    the canonical fuel species and stoichiometric O2 coefficient, and any
+    supplied value must agree with it.
+    """
+    mix = groups["mixture_config"]
+    mech = str(groups["physics_config"]["mechanism_id"]).strip().lower()
+    try:
+        canonical_fuel, canonical_stoich = MECHANISM_FUEL[mech]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mechanism_id {mech!r}") from exc
+
+    has_legacy = "hydrogen_mole_percent" in mix
+    has_fuel = "fuel_mole_percent" in mix
+    if has_legacy and has_fuel:
+        raise ValueError(
+            "mixture_config: supply exactly one of hydrogen_mole_percent "
+            "(legacy) or fuel_mole_percent"
+        )
+    if not has_legacy and not has_fuel:
+        raise ValueError(
+            "mixture_config: neither hydrogen_mole_percent nor "
+            "fuel_mole_percent was supplied"
+        )
+    if has_legacy:
+        if canonical_fuel != "H2":
+            raise ValueError(
+                f"hydrogen_mole_percent is the legacy H2 alias and cannot be "
+                f"used with mechanism {mech!r} (fuel {canonical_fuel})"
+            )
+        if "fuel_specie_name" in mix or "stoich_o2" in mix:
+            raise ValueError(
+                "mixture_config: fuel_specie_name/stoich_o2 require "
+                "fuel_mole_percent, not the legacy alias"
+            )
+        return
+
+    supplied_fuel = mix.get("fuel_specie_name")
+    if supplied_fuel is None:
+        mix["fuel_specie_name"] = canonical_fuel
+    else:
+        if not isinstance(supplied_fuel, str):
+            raise TypeError("fuel_specie_name must be a string")
+        if len(supplied_fuel.strip()) > 20:
+            raise ValueError("fuel_specie_name exceeds the Fortran character(20) length")
+        if supplied_fuel.strip().upper() != canonical_fuel:
+            raise ValueError(
+                f"fuel_specie_name {supplied_fuel!r} is inconsistent with "
+                f"mechanism {mech!r} (fuel {canonical_fuel})"
+            )
+        mix["fuel_specie_name"] = canonical_fuel
+
+    if "stoich_o2" not in mix:
+        mix["stoich_o2"] = canonical_stoich
+    else:
+        supplied_stoich = mix["stoich_o2"]
+        if isinstance(supplied_stoich, bool) or not isinstance(
+            supplied_stoich, (int, float)
+        ):
+            raise TypeError("stoich_o2 must be a real number")
+        if abs(float(supplied_stoich) - canonical_stoich) > 1.0e-12 * max(
+            1.0, canonical_stoich
+        ):
+            raise ValueError(
+                f"stoich_o2 {supplied_stoich!r} is inconsistent with "
+                f"mechanism {mech!r} (O2 coefficient {canonical_stoich})"
+            )
+        mix["stoich_o2"] = float(canonical_stoich)
+
+    effective_thermo_transport(mech, groups["physics_config"])
+
+
 def _validate_chemistry_config(chemistry: dict[str, Any]) -> None:
     if not chemistry:
         return
@@ -491,6 +613,7 @@ def validate_case(groups: dict[str, dict[str, Any]]) -> None:
             raise ValueError(f"{group}: unsupported key(s): {', '.join(sorted(unknown))}")
 
     _validate_chemistry_config(groups[CHEMISTRY_GROUP])
+    _normalize_mixture_fuel(groups)
 
     reactor = groups["reactor_config"]
     mix = groups["mixture_config"]
@@ -505,9 +628,12 @@ def validate_case(groups: dict[str, dict[str, Any]]) -> None:
     if float(reactor["cell_length_x"]) <= 0:
         raise ValueError("cell_length_x must be positive")
 
-    xh2 = float(mix["hydrogen_mole_percent"])
-    if not 0.0 < xh2 < 100.0:
-        raise ValueError("hydrogen_mole_percent must lie in (0,100)")
+    if "fuel_mole_percent" in mix:
+        fuel_percent = float(mix["fuel_mole_percent"])
+    else:
+        fuel_percent = float(mix["hydrogen_mole_percent"])
+    if not 0.0 < fuel_percent < 100.0:
+        raise ValueError("fuel mole percent must lie in (0,100)")
     if float(mix["n2_o2_molar_ratio"]) <= 0:
         raise ValueError("n2_o2_molar_ratio must be positive")
     if float(mix["initial_temperature"]) <= 0 or float(mix["initial_pressure"]) <= 0:
@@ -614,13 +740,23 @@ def varying_fields(cases: list[dict[str, Any]]) -> set[tuple[str, str]]:
     return {key for key, vals in values.items() if len(vals) > 1}
 
 
-def directory_token(group: str, key: str, value: Any) -> str:
+def directory_token(
+    group: str,
+    key: str,
+    value: Any,
+    groups: dict[str, dict[str, Any]] | None = None,
+) -> str:
     if (group, key) == ("mixture_config", "initial_temperature"):
         return f"T{float(value):g}"
     if (group, key) == ("mixture_config", "initial_pressure"):
         return f"P{float(value)/101325.0:.3g}atm".replace(".", "p")
     if (group, key) == ("mixture_config", "hydrogen_mole_percent"):
         return f"H2_{float(value):g}".replace(".", "p")
+    if (group, key) == ("mixture_config", "fuel_mole_percent"):
+        fuel = "FUEL"
+        if groups is not None:
+            fuel = str(groups["mixture_config"].get("fuel_specie_name", "FUEL"))
+        return f"{sanitize_token(fuel)}_{float(value):g}".replace(".", "p")
     if (group, key) == ("physics_config", "mechanism_id"):
         return str(value).upper()
     if (group, key) == ("physics_config", "solver_id"):
@@ -644,10 +780,14 @@ def make_label(item: dict[str, Any]) -> str:
     m = g["mixture_config"]
     p = g["physics_config"]
     backend = g.get(CHEMISTRY_GROUP, {}).get("chemistry_backend", "default")
+    fuel = str(m.get("fuel_specie_name", "H2"))
+    fuel_percent = float(
+        m.get("fuel_mole_percent", m.get("hydrogen_mole_percent"))
+    )
     return (
-        f"0D CV H2-air | T0={float(m['initial_temperature']):g} K, "
+        f"0D CV {fuel}-air | T0={float(m['initial_temperature']):g} K, "
         f"p0={float(m['initial_pressure'])/101325.0:.3g} atm, "
-        f"H2={float(m['hydrogen_mole_percent']):g} mol.% | "
+        f"{fuel}={fuel_percent:g} mol.% | "
         f"{str(p['mechanism_id']).upper()} | {solver_token(str(p['solver_id']))} | "
         f"N={int(r['cells_number_x'])}, dx={float(r['cell_length_x']):.3e} m, "
         f"dt0={float(p['initial_time_step']):.3e} s | "
@@ -668,7 +808,11 @@ def build_case_directory(
     for key in TOKEN_ORDER:
         if key in varying:
             group, field = key
-            tokens.append(directory_token(group, field, item["groups"][group][field]))
+            tokens.append(
+                directory_token(
+                    group, field, item["groups"][group][field], item["groups"]
+                )
+            )
 
     variants = {x["numerical_variant"] for x in cases}
     if len(variants) > 1:
@@ -698,6 +842,7 @@ def expand_campaign(data: dict[str, Any], laboratory: Laboratory) -> list[dict[s
         groups = deep_merge(groups, variant_override)
         groups.setdefault(CHEMISTRY_GROUP, {})
         _normalize_chemistry_config(groups[CHEMISTRY_GROUP])
+        _normalize_mixture_fuel(groups)
         groups.setdefault("case_config", {})["numerical_variant"] = variant_name
         validate_case({**groups, "case_config": groups["case_config"]})
         raw.append({
@@ -707,11 +852,16 @@ def expand_campaign(data: dict[str, Any], laboratory: Laboratory) -> list[dict[s
         })
 
     campaign = data["campaign"]
-    max_cases = int(campaign.get("max_cases", 100))
+    max_cases_raw = campaign.get("max_cases", 100)
+    if isinstance(max_cases_raw, bool) or not isinstance(max_cases_raw, int):
+        raise TypeError("campaign.max_cases must be an integer")
+    max_cases = int(max_cases_raw)
+    if max_cases <= 0:
+        raise ValueError("campaign.max_cases must be positive")
     if len(raw) > max_cases:
         raise ValueError(
             f"campaign expands to {len(raw)} cases, exceeding max_cases={max_cases}; "
-            "raise the limit explicitly after reviewing --preview"
+            "set campaign.max_cases explicitly after reviewing --preview"
         )
 
     prefix = str(campaign.get("case_id_prefix", "R"))
