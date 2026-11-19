@@ -3101,10 +3101,12 @@ _E0_BASE_REQUIRED_KEYS = (
     "nrg_source_root", "build_root", "equilibrium_executable",
 )
 _E0_VALIDATION_REQUIRED_KEYS = ("run_root", "harness", "cantera_python")
+_E0_AUDIT_REQUIRED_KEYS = _E0_BASE_REQUIRED_KEYS + ("audit_run_root",)
 _E0_REQUIRED_KEYS = _E0_BASE_REQUIRED_KEYS + _E0_VALIDATION_REQUIRED_KEYS
 _E0_BASE_PATH_KEYS = ("nrg_source_root", "build_root")
 _E0_PATH_KEYS = _E0_BASE_PATH_KEYS + _E0_VALIDATION_REQUIRED_KEYS
-_E0_OPERATIONS = ("build", "validation")
+_E0_OPERATIONS = ("build", "validation", "audit")
+_E0_SCOPES = ("build", "validation", "audit")
 # Optional independent reference: only these keys may be absent without making
 # the generic laboratory or the NRG package-interface build unready.
 _E0_OPTIONAL_REFERENCE_KEYS = frozenset({"cantera_python"})
@@ -3144,6 +3146,13 @@ _E0_AUTH_REL = "config/e0_authorization.toml"
 _E0_AUTH_PINS = (
     "commit", "source_sha256", "harness_sha256", "validation_config_sha256",
     "source_relative", "cmake_selector", "cmake_target", "mechanism_selector",
+)
+# Scope "build" needs only the source-identity pins.  harness_sha256 and
+# validation_config_sha256 are deliberately NOT required, so the two E0 build
+# commands can run before any validation harness exists.  Inventing hashes for
+# files that do not exist is exactly what must not happen.
+_E0_BUILD_PINS = (
+    "commit", "source_sha256", "source_relative", "cmake_selector", "cmake_target",
 )
 # Exactly the researcher-approved acceptance keys (R6).  The fixed threshold
 # VALUES live in the protected authorization record; [e0] cannot broaden them.
@@ -3305,6 +3314,78 @@ def _e0_authorization(lab: Laboratory) -> dict[str, Any]:
     return auth
 
 
+def _e0_read_auth_table(lab: Laboratory) -> dict[str, Any]:
+    """Read the protected authorization record without scope assumptions."""
+    auth_path = Path(lab.research_root).resolve() / _E0_AUTH_REL
+    if auth_path.is_symlink():
+        raise RuntimeError(f"authorization record is a symlink (refusing): {auth_path}")
+    if not auth_path.is_file():
+        raise RuntimeError(
+            f"E0 authorization record missing: {auth_path}; researcher installation "
+            "is out-of-band (see g1_security_bootstrap_patch_correction/"
+            "G1S1_APPLY_CHECKLIST.md)."
+        )
+    try:
+        with auth_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:  # noqa: BLE001 -- fail closed on any read/parse error
+        raise RuntimeError(f"E0 authorization record unreadable: {exc}")
+    auth = data.get("e0_authorization")
+    if not isinstance(auth, dict):
+        raise RuntimeError("[e0_authorization] table missing in authorization record")
+    return auth
+
+
+def _e0_authorization_scoped(lab: Laboratory, scope: str) -> dict[str, Any]:
+    """Load the authorization record for one explicit scope.
+
+    "validation" returns the unchanged coupled record; "build" requires only the
+    source-identity pins; "audit" adds the audited L0 scope, which is validated
+    by agent_workspace.l0_audit.
+    """
+    if scope not in _E0_SCOPES:
+        raise RuntimeError(f"unknown authorization scope {scope!r}")
+    if scope == "validation":
+        return _e0_authorization(lab)
+    auth = _e0_read_auth_table(lab)
+    if scope == "build":
+        missing = [k for k in _E0_BUILD_PINS if k not in auth]
+        if missing:
+            raise RuntimeError(f"[e0_authorization] missing build pins: {sorted(missing)}")
+        if not _is_sha256(str(auth["source_sha256"])):
+            raise RuntimeError("[e0_authorization].source_sha256 must be a 64-char hex SHA-256")
+        for key, want in (
+            ("source_relative", _E0_SOURCE_REL),
+            ("cmake_selector", _E0_CMAKE_SELECTOR),
+            ("cmake_target", _E0_CMAKE_TARGET),
+        ):
+            if str(auth[key]) != want:
+                raise RuntimeError(f"[e0_authorization].{key} must equal {want!r}")
+        commit = str(auth["commit"]).strip().lower()
+        if not (len(commit) == 40 and all(c in "0123456789abcdef" for c in commit)):
+            raise RuntimeError("[e0_authorization].commit must be a full 40-hex git commit")
+        return {**auth, "commit": commit}
+    from agent_workspace import l0_audit
+
+    build = _e0_authorization_scoped(lab, "build")
+    audited = l0_audit.load_audit_authorization(auth)
+    return {**build, "audit": audited}
+
+
+def _e0_audit_run_root(cfg: dict[str, Any], lab: Laboratory) -> Path:
+    """Validate [e0].audit_run_root with the same boundary policy as run_root."""
+    run_root = _e0_path(cfg, "audit_run_root", lab)
+    _reject_symlink_or_overlap(_e0_path(cfg, "build_root", lab), run_root)
+    _reject_symlink_or_overlap(run_root, _e0_nrg_root(cfg, lab))
+    try:
+        run_root.relative_to(Path(lab.research_root).resolve())
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(f"[e0].audit_run_root overlaps trusted research_root: {run_root}")
+    return run_root
+
+
 def _e0_config(lab: Laboratory, operation: str = "validation") -> dict[str, Any]:
     """Load and type-check OPERATIONAL [e0] settings only (R2).
 
@@ -3326,7 +3407,12 @@ def _e0_config(lab: Laboratory, operation: str = "validation") -> dict[str, Any]
     """
     if operation not in _E0_OPERATIONS:
         raise RuntimeError(f"[e0] unknown config operation {operation!r}; expected one of {list(_E0_OPERATIONS)}")
-    required = _E0_BASE_REQUIRED_KEYS if operation == "build" else _E0_REQUIRED_KEYS
+    if operation == "build":
+        required = _E0_BASE_REQUIRED_KEYS
+    elif operation == "audit":
+        required = _E0_AUDIT_REQUIRED_KEYS
+    else:
+        required = _E0_REQUIRED_KEYS
     tables: list[dict[str, Any]] = []
     for src in (lab.config_path, lab.local_config_path):
         if src is None or not src.is_file():
@@ -3372,6 +3458,8 @@ def _e0_config(lab: Laboratory, operation: str = "validation") -> dict[str, Any]
     if btype not in ("release", "debug"):
         raise RuntimeError("[e0] build_type must be 'release' or 'debug'")
     merged["build_type"] = btype
+    if merged.get("fortran_compiler") is not None:
+        merged["fortran_compiler"] = _e0_fortran_selection(merged["fortran_compiler"])
     return merged
 
 
@@ -3411,9 +3499,12 @@ def _git(root: Path, *args: str, timeout: int = 30) -> str:
     return proc.stdout
 
 
+_E0_FORTRAN_COMPILERS = ("gfortran", "gfortran-13", "ifx", "ifort")
+
+
 def _e0_discover_fortran() -> tuple[str, str]:
     """Return (compiler, first version line); fail if a present compiler's --version fails."""
-    for cand in ("gfortran", "gfortran-13", "ifx", "ifort"):
+    for cand in _E0_FORTRAN_COMPILERS:
         try:
             proc = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=10, env=_sanitized_env())
         except FileNotFoundError:
@@ -3427,6 +3518,61 @@ def _e0_discover_fortran() -> tuple[str, str]:
             raise RuntimeError(f"Fortran compiler {cand} '--version' produced no output")
         return cand, first[0]
     raise RuntimeError("no supported Fortran compiler found (gfortran/gfortran-13/ifx/ifort)")
+
+
+def _e0_probe_fortran(cand: str) -> tuple[str, str]:
+    """Probe one explicitly selected compiler under the build environment.
+
+    The probe deliberately uses the SAME sanitized environment as build
+    execution, so [e0].fortran_compiler is validated under the conditions the
+    build will actually run in.  A failure is fatal: an explicit selection never
+    falls back to a different compiler.
+    """
+    try:
+        proc = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=10, env=_sanitized_env())
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"selected Fortran compiler {cand!r} not found on PATH of the sanitized build "
+            f"environment (allowed keys: {sorted(_E0_ENV_ALLOWLIST)})"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"selected Fortran compiler {cand!r} --version timed out")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"selected Fortran compiler {cand!r} found but '--version' exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:400]}"
+        )
+    first = (proc.stdout or proc.stderr or "").strip().splitlines()
+    if not first:
+        raise RuntimeError(f"selected Fortran compiler {cand!r} '--version' produced no output")
+    return cand, first[0]
+
+
+def _e0_fortran_selection(value: Any) -> str:
+    """Validate [e0].fortran_compiler: a supported NAME, never a path."""
+    if not isinstance(value, str):
+        raise RuntimeError("[e0] fortran_compiler must be a string compiler identifier")
+    name = value.strip().lower()
+    if name not in _E0_FORTRAN_COMPILERS:
+        raise RuntimeError(
+            f"[e0] fortran_compiler must be one of {list(_E0_FORTRAN_COMPILERS)} "
+            f"(a name, not a path); got {value!r}"
+        )
+    return name
+
+
+def _e0_select_fortran(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the compiler selection used by plan, execute and the manifest.
+
+    * [e0].fortran_compiler absent -> unchanged automatic discovery order.
+    * present -> exactly that compiler, or fail closed; never a fallback.
+    """
+    selected = cfg.get("fortran_compiler")
+    if selected is None:
+        compiler, version = _e0_discover_fortran()
+        return {"mode": "auto", "identifier": compiler, "compiler": compiler, "version": version}
+    compiler, version = _e0_probe_fortran(_e0_fortran_selection(selected))
+    return {"mode": "explicit", "identifier": compiler, "compiler": compiler, "version": version}
 
 
 def _e0_checkout_preflight(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory) -> dict[str, Any]:
@@ -3593,8 +3739,35 @@ def _e0_remaining(deadline: float) -> int:
 class _E0Cancellation(RuntimeError):
     """Cancellation of an E0 child process; never a scientific PASS."""
 
+    cancelled = True
 
-def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path) -> str:
+
+class _BoundedRunError(RuntimeError):
+    """Fixed-command child failure with a structured, non-PASS outcome.
+
+    Subclasses RuntimeError, so every existing E0 handler keeps working.  The
+    structured fields exist so downstream consumers never have to infer a child
+    outcome from message text (a log line, for example)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: str,
+        returncode: int | None = None,
+        timed_out: bool = False,
+        cancelled: bool = False,
+        log_path: Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.returncode = returncode
+        self.timed_out = timed_out
+        self.cancelled = cancelled
+        self.log_path = log_path
+
+
+def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path, cwd: Path | None = None) -> str:
     """Run fixed argv in a new process group; handle timeout and bridge SIGTERM.
 
     The SIGTERM handler is a *flag only*.  It is installed in the bridge's
@@ -3628,7 +3801,7 @@ def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path) -> st
         # as soon as Popen returns the new session's process-group identifier.
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=_sanitized_env(), start_new_session=True,
+            env=_sanitized_env(), start_new_session=True, cwd=cwd,
         )
         deadline = time.monotonic() + float(timeout)
         while True:
@@ -3647,11 +3820,16 @@ def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path) -> st
             raise _E0Cancellation(f"{label} cancelled by external SIGTERM")
         outcome = f"EXIT_{proc.returncode}"
         if proc.returncode != 0:
-            raise RuntimeError(f"{label} exited {proc.returncode}; see {log_path}: {err[-2000:]}")
+            raise _BoundedRunError(
+                f"{label} exited {proc.returncode}; see {log_path}: {err[-2000:]}",
+                outcome=outcome, returncode=proc.returncode, log_path=log_path,
+            )
         return out
     except BaseException as exc:
         outcome = "CANCELLED" if cancelled["requested"] or isinstance(exc, _E0Cancellation) else (
-            "TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired) else "FAILED"
+            "TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired) else (
+                exc.outcome if isinstance(exc, _BoundedRunError) else "FAILED"
+            )
         )
         if proc is not None:
             _kill_process_group(proc)
@@ -3663,7 +3841,10 @@ def _run_bounded(cmd: list[str], label: str, timeout: int, log_path: Path) -> st
                 _kill_process_group(proc)
                 out, err = "", ""
         if isinstance(exc, subprocess.TimeoutExpired):
-            raise RuntimeError(f"{label} timed out after {timeout}s; process group terminated. see {log_path}") from exc
+            raise _BoundedRunError(
+                f"{label} timed out after {timeout}s; process group terminated. see {log_path}",
+                outcome="TIMEOUT", timed_out=True, log_path=log_path,
+            ) from exc
         raise
     finally:
         # Restore before exiting this fixed E0 operation.  A second SIGTERM
@@ -3781,7 +3962,7 @@ def _e0_read_git_blob(root: Path, oid: str, *, max_bytes: int = 64 * 1024 * 1024
     return data
 
 
-def _e0_stage_task_setup(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory, scratch: Path) -> dict[str, Any]:
+def _e0_stage_task_setup(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory, scratch: Path, required_mechanisms: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Stage approved-commit Git blobs into an isolated scratch task_setup tree.
 
     Neither the index nor the working tree can change authorized file bytes.
@@ -3793,7 +3974,8 @@ def _e0_stage_task_setup(cfg: dict[str, Any], auth: dict[str, Any], lab: Laborat
     inventory = _e0_git_objects(root, commit, _E0_TASK_SETUP_REL, _E0_SOURCE_REL)
     prefix = _E0_TASK_SETUP_REL + "/"
     task_files = {p for p in inventory if p.startswith(prefix)}
-    required = {f"{prefix}chemical_mechanisms/{rel}" for rel in _E0_SIX_MECHANISMS}
+    selected = _E0_SIX_MECHANISMS if required_mechanisms is None else tuple(required_mechanisms)
+    required = {f"{prefix}chemical_mechanisms/{rel}" for rel in selected}
     missing = sorted(required - task_files)
     if missing:
         raise RuntimeError("six-mechanism manifest incomplete in approved commit: " + "; ".join(missing))
@@ -4274,10 +4456,11 @@ def _e0_validation_config_snapshot(harness_path: Path, auth: dict[str, Any], scr
 def cmd_e0_build_plan(args: argparse.Namespace, lab: Laboratory) -> int:
     try:
         cfg = _e0_config(lab, operation="build")
-        auth = _e0_authorization(lab)
+        auth = _e0_authorization_scoped(lab, "build")
         pre = _e0_checkout_preflight(cfg, auth, lab)
         _e0_boundaries(cfg, lab, require_run_root=False)
-        compiler, version = _e0_discover_fortran()
+        selection = _e0_select_fortran(cfg)
+        compiler, version = selection["compiler"], selection["version"]
         cmake_ver = subprocess.run(["cmake", "--version"], capture_output=True, text=True, env=_sanitized_env()).stdout.strip().splitlines()
         return emit({
             "can_build": True,
@@ -4291,6 +4474,8 @@ def cmd_e0_build_plan(args: argparse.Namespace, lab: Laboratory) -> int:
             "source_path": pre["source_path"],
             "fortran_compiler": compiler,
             "fortran_version": version,
+            "fortran_selection": selection["mode"],
+            "fortran_identifier": selection["identifier"],
             "cmake_version": cmake_ver[0] if cmake_ver else "unknown",
             "build_type": cfg["build_type"],
             "build_root": str(_e0_path(cfg, "build_root", lab)),
@@ -4306,7 +4491,7 @@ def cmd_e0_build_plan(args: argparse.Namespace, lab: Laboratory) -> int:
 def cmd_e0_build_execute(args: argparse.Namespace, lab: Laboratory) -> int:
     try:
         cfg = _e0_config(lab, operation="build")
-        auth = _e0_authorization(lab)
+        auth = _e0_authorization_scoped(lab, "build")
         pre = _e0_checkout_preflight(cfg, auth, lab)
         _e0_boundaries(cfg, lab, require_run_root=False)
         # Mandatory plan->execute binding (correction 6): identity fields are
@@ -4317,7 +4502,8 @@ def cmd_e0_build_execute(args: argparse.Namespace, lab: Laboratory) -> int:
             raise RuntimeError("source SHA-256 changed since plan; researcher review required.")
         if args.expected_commit != pre["commit"]:
             raise RuntimeError("checkout commit changed since plan; researcher review required.")
-        compiler, cver = _e0_discover_fortran()
+        selection = _e0_select_fortran(cfg)
+        compiler, cver = selection["compiler"], selection["version"]
         root = _e0_nrg_root(cfg, lab)
         build_root = _e0_path(cfg, "build_root", lab)
         if build_root.exists() and any(build_root.iterdir()):
@@ -4354,6 +4540,8 @@ def cmd_e0_build_execute(args: argparse.Namespace, lab: Laboratory) -> int:
             "build_type": build_type,
             "fortran_compiler": compiler,
             "fortran_version": cver,
+            "fortran_selection": selection["mode"],
+            "fortran_identifier": selection["identifier"],
             "cmake_version": cmake_ver[0] if cmake_ver else "unknown",
             "built_at": utc_now(),
         }
@@ -4531,6 +4719,76 @@ def cmd_e0_validate_execute(args: argparse.Namespace, lab: Laboratory) -> int:
         }, 3)
     except Exception as exc:
         return emit({"error": f"{type(exc).__name__}: {exc}", "scientific_pass": False}, 2)
+
+
+def _l0_audit_host(cfg: dict[str, Any], auth: dict[str, Any], lab: Laboratory) -> object:
+    """Assemble the privileged host for the audit core (no user input)."""
+    from agent_workspace import l0_audit
+
+    repo = _e0_nrg_root(cfg, lab)
+    prefix = _E0_TASK_SETUP_REL + "/"
+    inventory = _e0_git_objects(repo, auth["commit"], _E0_TASK_SETUP_REL, _E0_SOURCE_REL)
+    required = tuple(sorted({case["mechanism"] for case in auth["audit"]["cases"]}))
+
+    def commit_blob_sha256(rel: str) -> str:
+        entry = inventory.get(prefix + rel)
+        if entry is None:
+            raise RuntimeError(f"approved commit is missing audit input: {rel}")
+        return hashlib.sha256(_e0_read_git_blob(repo, entry[1])).hexdigest()
+
+    def stage(dest: Path) -> dict[str, Any]:
+        return _e0_stage_task_setup(cfg, auth, lab, dest, required_mechanisms=required)
+
+    def verify() -> dict[str, Any]:
+        return _e0_checkout_preflight(cfg, auth, lab)
+
+    return l0_audit.AuditHost(
+        repo_root=repo,
+        build_root=_e0_path(cfg, "build_root", lab),
+        run_root=_e0_audit_run_root(cfg, lab),
+        commit=auth["commit"],
+        source_sha256=auth["source_sha256"],
+        executable_name=cfg["equilibrium_executable"],
+        build_type=cfg["build_type"],
+        sha256_file=sha256_file,
+        commit_blob_sha256=commit_blob_sha256,
+        stage_task_setup=stage,
+        run_bounded=_run_bounded,
+        verify_worktree=verify,
+        utc_now=utc_now,
+    )
+
+
+def cmd_l0_audit_plan(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="audit")
+        auth = _e0_authorization_scoped(lab, "audit")
+        from agent_workspace import l0_audit
+
+        return emit(l0_audit.plan(_l0_audit_host(cfg, auth, lab), auth["audit"]))
+    except Exception as exc:
+        return emit({"can_run": False, "error": f"{type(exc).__name__}: {exc}"}, 2)
+
+
+def cmd_l0_audit_execute(args: argparse.Namespace, lab: Laboratory) -> int:
+    try:
+        cfg = _e0_config(lab, operation="audit")
+        auth = _e0_authorization_scoped(lab, "audit")
+        from agent_workspace import l0_audit
+
+        expected = {
+            "executable_sha256": args.expected_executable_sha256,
+            "commit": args.expected_commit,
+            "source_sha256": args.expected_source_sha256,
+            "cases_sha256": args.expected_cases_sha256,
+        }
+        payload = l0_audit.execute(
+            _l0_audit_host(cfg, auth, lab), auth["audit"], expected,
+            continue_on_failure=bool(args.continue_on_failure),
+        )
+        return emit(payload, 0 if payload.get("complete") else 2)
+    except Exception as exc:
+        return emit({"executed": False, "error": f"{type(exc).__name__}: {exc}"}, 2)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4839,6 +5097,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--expected-validation-config-sha256", default=None)
     s.add_argument("--expected-cantera-python-sha256", default=None)
 
+    s = sub.add_parser("l0-audit-plan")
+
+    s = sub.add_parser("l0-audit-execute")
+    s.add_argument("--expected-executable-sha256", default=None)
+    s.add_argument("--expected-commit", default=None)
+    s.add_argument("--expected-source-sha256", default=None)
+    s.add_argument("--expected-cases-sha256", default=None)
+    s.add_argument("--continue-on-failure", action="store_true")
+
     return p
 
 
@@ -4910,6 +5177,8 @@ def main() -> int:
             "e0-build-execute": cmd_e0_build_execute,
             "e0-validate-plan": cmd_e0_validate_plan,
             "e0-validate-execute": cmd_e0_validate_execute,
+            "l0-audit-plan": cmd_l0_audit_plan,
+            "l0-audit-execute": cmd_l0_audit_execute,
         }
         return commands[args.command](args, lab)
     except Exception as exc:
