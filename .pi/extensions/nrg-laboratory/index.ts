@@ -1497,6 +1497,147 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "nrg_l0_audit_plan",
+    label: "NRG L0 Audit Plan",
+    description: "Read-only readiness plan for the mechanism-independent L0 audit of the mesh-free NRG thermochemistry/kinetics interface. Verifies the authorized commit, audit source hash, built executable hash, build manifest identity, per-case approved-commit input hashes and a fresh audit run root. Writes nothing, builds nothing and runs nothing.",
+    promptSnippet: "Plan the trusted L0 direct audit (read-only)",
+    promptGuidelines: [
+      "Use only after the operator installed the scoped audit authorization record and a hash-pinned executable built from the approved commit.",
+      "This command is read-only: it never builds, never executes the audit binary and never writes to the run root.",
+      "can_run=false is a readiness result, not a scientific verdict; report the exact error.",
+      "Mechanism set, modes and compositions come only from the authorization record; no argument can broaden them.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["l0-audit-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_l0_audit_execute",
+    label: "NRG L0 Audit Execute",
+    description: "Execute the authorized, mechanism-independent L0 audit of the existing mesh-free NRG thermochemistry/kinetics interface in isolated per-case directories, with plan-to-execute hash binding, a per-case wall cap bounded by the remaining total budget, a strict unexpected-output policy and complete output/log/artifact hashing. Never runs computing_module and never writes to canonical task_setup, runs/ or campaigns/.",
+    promptSnippet: "Execute the trusted L0 direct audit",
+    promptGuidelines: [
+      "Use only after nrg_l0_audit_plan returned can_run=true and the operator authorized execution for this exact plan.",
+      "A zero exit code is not a scientific PASS; the recorded per-case status, log hash and artifact hashes are authoritative.",
+      "Fixtures are grammar checks only: a refusal is a PASS only with a genuine nonzero parser exit and the frozen diagnostic.",
+      "Do not retry a failed case; report its classification and stop.",
+      "This never builds NRG, never runs computing_module and never executes Cantera.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["l0-audit-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "l0 audit execute requires interactive confirmation", plan });
+      if (!plan.executable_sha256 || !plan.commit || !plan.source_sha256 || !plan.cases_sha256)
+        return toolResult({ error: "l0 audit plan missing executable/commit/source/cases identity; refusing to execute", plan });
+      const ok = await ctx.ui.confirm(
+        "Execute the authorized L0 audit?",
+        `Commit ${String(plan.commit).slice(0, 12)}, executable ${String(plan.executable_sha256).slice(0, 12)}, ` +
+        `${Array.isArray(plan.cases) ? plan.cases.length : "?"} case(s), fixtures ${plan.fixtures_enabled ? "on" : "off"}, ` +
+        `run root ${plan.audit_run_root}. Isolated; no CFD, no Cantera, no build.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      const execArgs = [
+        "l0-audit-execute",
+        "--expected-executable-sha256", plan.executable_sha256,
+        "--expected-commit", plan.commit,
+        "--expected-source-sha256", plan.source_sha256,
+        "--expected-cases-sha256", plan.cases_sha256,
+      ];
+      return toolResult(await bridge(execArgs, signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_plan",
+    label: "NRG G2-L1 Convergence Plan",
+    description: "Read-only plan for a fixed 6-case, hash-pinned, single-cell SLATEC tolerance/time-step pilot. Does not build NRG, execute binaries, run Cantera, or write files.",
+    promptGuidelines: [
+      "Run this before nrg_g2_l1_execute; inspect can_run and plan_sha256.",
+      "Only the operator-installed authorization and immutable source hashes select the binary and scientific cases.",
+      "Do not equate a completed six-case pilot with Cantera accuracy validation.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["g2-l1-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_execute",
+    label: "NRG G2-L1 Convergence Execute",
+    description: "After explicit interactive approval, run the fixed 6-case G2-L1 pilot in the trusted .local run root and export hash-verified evidence into the agent-readable study path. No arbitrary binary, chemistry or path arguments.",
+    promptGuidelines: [
+      "Never start without a successful read-only plan and interactive researcher confirmation.",
+      "STOP on first unexpected result; preserve evidence; never silently retry.",
+      "Report the convergence comparisons as provisional: no new Cantera reference is run here.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["g2-l1-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "G2-L1 execute requires interactive confirmation", plan });
+      if (!plan.plan_sha256 || !Array.isArray(plan.cases) || plan.cases.length !== 6)
+        return toolResult({ error: "G2-L1 plan missing expected six-case identity; refusing", plan });
+      const ok = await ctx.ui.confirm(
+        "Execute six G2-L1 chemistry cases?",
+        `B2 ${String(plan.binary_sha256).slice(0, 12)}, 3 eps × 2 dt, ≤${plan.case_timeout_s}s/case, ` +
+        `trusted run root ${plan.run_root}. No builds, no CFD, no Cantera.`,
+      );
+      if (!ok) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge(
+        ["g2-l1-execute", "--expected-plan-sha256", plan.plan_sha256], signal, E0_TIMEOUT_MS,
+      ));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_stage2_plan",
+    label: "NRG G2-L1 Reactive Chemistry Plan",
+    description: "Read-only bounded 5/20 us isothermal H2-air Cantera screening and SLATEC convergence plan. Verifies the same pinned B2 binary and KEROMNES; no execution.",
+    promptGuidelines: [
+      "The reference first screens oxygen consumption; if below 1% at 20 us, no NRG cases launch.",
+      "Review can_run, plan_sha256, maximum of six cases, timeouts and evidence destinations.",
+      "Do not claim ignition-delay validation: temperature is held constant.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      return toolResult(await bridge(["g2-l1-stage2-plan"], signal, E0_TIMEOUT_MS));
+    },
+  });
+
+  pi.registerTool({
+    name: "nrg_g2_l1_stage2_execute",
+    label: "NRG G2-L1 Reactive Chemistry Execute",
+    description: "Interactive researcher-confirmed Cantera oxygen-consumption screen, then at most six bounded single-cell NRG cases. Preserves evidence; stops for weak signal, failure or unexpected outputs.",
+    promptGuidelines: [
+      "Invoke only following a matching read-only Stage-2 plan and interactive approval.",
+      "Reference isothermal CV chemistry, not adiabatic ignition; do not silently extend the horizon.",
+      "Inspect and report the exported comparison and archive checksum; no automatic retries.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      const plan = await bridge(["g2-l1-stage2-plan"], signal, E0_TIMEOUT_MS);
+      if (plan.error || !plan.can_run) return toolResult(plan);
+      if (!ctx.hasUI) return toolResult({ error: "G2 Stage-2 execution requires interactive operator confirmation", plan });
+      if (!plan.plan_sha256 || plan.maximum_cases !== 6 || plan.maximum_steps_per_case !== 4000)
+        return toolResult({ error: "G2 Stage-2 plan envelope invalid; refusing", plan });
+      const approved = await ctx.ui.confirm(
+        "Execute the G2-L1 reactive-chemistry pilot?",
+        `Cantera 5/20 us reference O2 screen (>=1% required), then at most 6 NRG cases; ` +
+        `<=${plan.reference_timeout_s}s reference and <=${plan.case_timeout_s}s per NRG case. ` +
+        `B2 ${String(plan.binary_sha256).slice(0,12)}, run root ${plan.run_root}. No rebuild or Cantera ignition claim.`,
+      );
+      if (!approved) return toolResult({ cancelled: true, plan });
+      return toolResult(await bridge(
+        ["g2-l1-stage2-execute", "--expected-plan-sha256", plan.plan_sha256], signal, E0_TIMEOUT_MS,
+      ));
+    },
+  });
+
   pi.registerCommand("nrg-tools", {
     description: "Show registered and active NRG laboratory tools",
     handler: async (_args, ctx) => {

@@ -1,0 +1,12 @@
+# OPERATOR-ONLY configuration, installed as config/g2_l1_authorization.toml.
+# NEVER put absolute machine-local paths or authorization records in Git.
+# The pilot's six cases, initial state, mechanism, executable SHA and source
+# identities are fixed in agent_workspace/g2_l1_convergence.py.
+[g2_l1]
+schema_version = 1
+nrg_source_root = "/absolute/path/to/NRG-checkout"
+binary_path = "/absolute/path/to/pinned/build-B2/bin/Release/g2_l1_driver"
+gate_b_archive = "/absolute/path/to/gate-b-r3/G2_L1_Gate_B_Evidence.tar.gz"
+run_root = "/absolute/path/to/nrg-ai-laboratory/.local/g2_l1_runs/G2_L1_Agent_Pilot_r1"
+export_dir = "/absolute/path/to/nrg-ai-laboratory/agent_workspace/studies/nrg_0d_verification_program/G2_L1_Agent_Pilot_r1"
+per_case_timeout_s = 25

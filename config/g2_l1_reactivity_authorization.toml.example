@@ -1,0 +1,8 @@
+# Example only. The real record is operator-installed, locally ignored by Git.
+# Do not reuse the Stage-1 completed run/export directories.
+[g2_l1_stage2]
+schema_version = 1
+run_root = "/absolute/path/to/nrg-ai-laboratory/.local/g2_l1_runs/G2_L1_Reactivity_r1"
+export_dir = "/absolute/path/to/nrg-ai-laboratory/agent_workspace/studies/nrg_0d_verification_program/G2_L1_Reactivity_r1"
+case_timeout_s = 25
+reference_timeout_s = 120
